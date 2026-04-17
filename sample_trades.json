@@ -1,0 +1,46 @@
+{
+  "_comment": "Sample trades for the Money Program daemon. Drop this into money-program-trading/data/trades.json (overwriting or appending to the trades array). Only the 'trades' array is read; top-level comment keys like this are ignored by the loader but preserved on save.",
+  "_schema": {
+    "required": ["symbol", "direction", "entry_low", "entry_high", "stop", "stake"],
+    "optional": ["market", "status", "notes", "ig_epic"],
+    "price_convention": "US stocks: prices in DOLLARS (e.g. 390.00). UK stocks: prices in PENCE (e.g. 116.0). stake = £ per point (1 point = 1 cent for US, 1 pence for UK).",
+    "direction_values": ["LONG", "SHORT"],
+    "market_values": ["US", "UK"],
+    "status_values_at_entry": ["PENDING"]
+  },
+  "trades": [
+    {
+      "symbol": "NVDA",
+      "direction": "LONG",
+      "market": "US",
+      "entry_low": 142.50,
+      "entry_high": 144.20,
+      "stop": 138.80,
+      "stake": 0.18,
+      "status": "PENDING",
+      "notes": "SAMPLE — VCP breakout off 50DMA, RS 92, ADX 31"
+    },
+    {
+      "symbol": "SHOP",
+      "direction": "SHORT",
+      "market": "US",
+      "entry_low": 88.20,
+      "entry_high": 89.50,
+      "stop": 92.30,
+      "stake": 0.15,
+      "status": "PENDING",
+      "notes": "SAMPLE — S-B breakdown, distribution 4/10 days, RS 22"
+    },
+    {
+      "symbol": "VOD",
+      "direction": "LONG",
+      "market": "UK",
+      "entry_low": 78.50,
+      "entry_high": 80.10,
+      "stop": 76.00,
+      "stake": 1.20,
+      "status": "PENDING",
+      "notes": "SAMPLE — pence prices. UK spread bet. Stake 1.2 £/pt = £1.20 per 1p move"
+    }
+  ]
+}

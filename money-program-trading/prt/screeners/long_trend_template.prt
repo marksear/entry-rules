@@ -1,0 +1,82 @@
+// ════════════════════════════════════════════════════════════════
+// MONEY PROGRAM — LONG TREND TEMPLATE SCAN (Rule L1 + L2 + L3)
+// ════════════════════════════════════════════════════════════════
+// ProScreener scan — runs server-side on ProRealTime.
+// Finds stocks passing all long-side qualification gates.
+//
+// Deploy on: FTSE 100, FTSE 250, S&P 500, NASDAQ 100
+// Timeframe: Daily
+// ════════════════════════════════════════════════════════════════
+
+// ── GATE 1: TREND TEMPLATE (10 conditions) ───────────────────
+// Minervini's SEPA criteria — all must be TRUE
+
+myMA50 = Average[50](close)
+myMA150 = Average[150](close)
+myMA200 = Average[200](close)
+myMA200_1mo = Average[200](close)[22]  // 200 MA from 22 trading days ago
+my52wkHigh = Highest[260](high)
+my52wkLow = Lowest[260](low)
+
+// Condition 1: Price above 150-day MA
+c1 = close > myMA150
+
+// Condition 2: Price above 200-day MA
+c2 = close > myMA200
+
+// Condition 3: 150 MA above 200 MA (MAs stacked bullish)
+c3 = myMA150 > myMA200
+
+// Condition 4: 200 MA trending up for at least 1 month
+c4 = myMA200 > myMA200_1mo
+
+// Condition 5: 50 MA above 150 MA
+c5 = myMA50 > myMA150
+
+// Condition 6: 50 MA above 200 MA
+c6 = myMA50 > myMA200
+
+// Condition 7: Price above 50-day MA
+c7 = close > myMA50
+
+// Condition 8: Price at least 25% above 52-week low
+c8 = close >= my52wkLow * 1.25
+
+// Condition 9: Price within 25% of 52-week high
+c9 = close >= my52wkHigh * 0.75
+
+// Note: RS percentile (condition 10) cannot be computed in PRT
+// because it requires cross-universe ranking. This is handled
+// by the Python orchestrator after the scan results are received.
+
+trendTemplate = c1 AND c2 AND c3 AND c4 AND c5 AND c6 AND c7 AND c8 AND c9
+
+// ── GATE 2: ADX TREND STRENGTH ───────────────────────────────
+// Raschke: ADX(14) > 25 confirms genuine trend, not chop
+
+myADX = ADX[14]
+adxOK = myADX > 25
+
+// ── GATE 3: VOLUME DRY-UP IN BASE ───────────────────────────
+// O'Neil / Minervini: ≥ 2 of last 5 sessions with volume
+// below 60% of the 50-day average. This is the footprint
+// of institutional holders sitting tight — supply dried up.
+
+avgVol = Average[50](Volume)
+threshold = avgVol * 0.60
+
+dry1 = Volume[1] < threshold
+dry2 = Volume[2] < threshold
+dry3 = Volume[3] < threshold
+dry4 = Volume[4] < threshold
+dry5 = Volume[5] < threshold
+
+dryCount = dry1 + dry2 + dry3 + dry4 + dry5
+volDryOK = dryCount >= 2
+
+// ── COMBINED SCAN ────────────────────────────────────────────
+// All three gates must pass
+
+allGates = trendTemplate AND adxOK AND volDryOK
+
+SCREENER[allGates] (myADX AS "ADX", dryCount AS "Dry Sessions", close AS "Price", myMA50 AS "MA50", my52wkHigh AS "52wk High")

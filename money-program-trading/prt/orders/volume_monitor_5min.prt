@@ -1,0 +1,100 @@
+// ════════════════════════════════════════════════════════════════
+// MONEY PROGRAM — MID-SESSION VOLUME MONITOR (Rules L5 / S5)
+// ProOrder System — 5-Minute Bars
+// ════════════════════════════════════════════════════════════════
+// Runs alongside the daily entry systems to perform intraday
+// volume confirmation checks.
+//
+// At mid-session: if projected volume < 1.4× 50d avg → reduce
+// At close: if actual volume still < threshold → close pilot
+//
+// This system does NOT enter trades. It manages existing
+// positions opened by the daily entry systems.
+//
+// Deploy: On each instrument where a breakout entry was placed today
+// Timeframe: 5-minute bars
+// ════════════════════════════════════════════════════════════════
+
+DEFPARAM CumulateOrders = false
+
+// ── CONFIGURATION ────────────────────────────────────────────
+ONCE avgVol50d = 0          // 50-day avg volume (set by orchestrator)
+ONCE sessionMinutes = 390   // US=390, UK=510 (set by orchestrator)
+ONCE volThreshold = 1.40    // 1.4× average
+ONCE midCheckDone = 0
+ONCE market = 0             // 0=US, 1=UK
+
+// ── VOLUME TRACKING ──────────────────────────────────────────
+// Accumulate volume across 5-min bars since open
+// Reset at session open
+IF time = 093000 OR time = 080000 THEN  // US open 09:30 / UK open 08:00
+    todayVolume = 0
+    midCheckDone = 0
+ENDIF
+
+todayVolume = todayVolume + Volume
+
+// ── ELAPSED MINUTES ──────────────────────────────────────────
+// Calculate minutes since market open
+IF market = 0 THEN
+    // US: opens 09:30 ET
+    elapsedBars = (time - 093000) / 500  // Rough: each 5-min bar
+ELSE
+    // UK: opens 08:00 GMT
+    elapsedBars = (time - 080000) / 500
+ENDIF
+elapsedMinutes = MAX(elapsedBars * 5, 5)
+
+// ── PROJECT END-OF-DAY VOLUME ────────────────────────────────
+IF elapsedMinutes > 0 AND sessionMinutes > 0 THEN
+    projectedVol = todayVolume * (sessionMinutes / elapsedMinutes)
+ELSE
+    projectedVol = 0
+ENDIF
+
+requiredVol = avgVol50d * volThreshold
+
+// ── MID-SESSION CHECK ────────────────────────────────────────
+// US: 11:30 ET (time=113000), UK: 12:15 GMT (time=121500)
+midTime = 113000
+IF market = 1 THEN
+    midTime = 121500
+ENDIF
+
+IF time >= midTime AND midCheckDone = 0 AND ONMARKET THEN
+    midCheckDone = 1
+    IF projectedVol < requiredVol THEN
+        // PILOT MODE: reduce to 50%
+        // Note: In PRT, we can't easily halve a position directly.
+        // The Python orchestrator handles the actual reduction via
+        // IG REST API. This system flags the condition.
+        //
+        // For now, we use a graph indicator to signal the issue.
+        // In a full deployment, this would trigger via the streaming
+        // connection back to the orchestrator.
+        GRAPH projectedVol AS "Projected Vol"
+        GRAPH requiredVol AS "Required Vol"
+    ENDIF
+ENDIF
+
+// ── END-OF-DAY CHECK ─────────────────────────────────────────
+// US: 15:55 ET (5 min before close), UK: 16:25 GMT
+closeTime = 155500
+IF market = 1 THEN
+    closeTime = 162500
+ENDIF
+
+IF time >= closeTime AND ONMARKET THEN
+    IF todayVolume < requiredVol THEN
+        // VOLUME CONFIRMATION FAILED — close the pilot
+        // Same note as above: in production, the Python orchestrator
+        // handles the close via REST API based on streaming data.
+        // This is the server-side backup.
+        IF LONGONMARKET THEN
+            SELL AT MARKET
+        ENDIF
+        IF SHORTONMARKET THEN
+            EXITSHORT AT MARKET
+        ENDIF
+    ENDIF
+ENDIF

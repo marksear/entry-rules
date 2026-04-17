@@ -1,0 +1,80 @@
+// ════════════════════════════════════════════════════════════════
+// MONEY PROGRAM — SHORT INVERSE TREND TEMPLATE (Rule S1 + S2 + S3)
+// ════════════════════════════════════════════════════════════════
+// ProScreener scan — finds stocks in confirmed Stage 4 decline
+// passing all short-side qualification gates.
+//
+// Deploy on: FTSE 100, FTSE 250, S&P 500, NASDAQ 100
+// Timeframe: Daily
+// ════════════════════════════════════════════════════════════════
+
+// ── GATE S1: INVERSE TREND TEMPLATE (10 conditions) ──────────
+// Mirror of long template — all MAs stacked bearish
+
+myMA50 = Average[50](close)
+myMA150 = Average[150](close)
+myMA200 = Average[200](close)
+myMA200_1mo = Average[200](close)[22]
+my52wkHigh = Highest[260](high)
+my52wkLow = Lowest[260](low)
+
+// Condition 1: Price BELOW 150-day MA
+c1 = close < myMA150
+
+// Condition 2: Price BELOW 200-day MA
+c2 = close < myMA200
+
+// Condition 3: 150 MA BELOW 200 MA (MAs stacked bearish)
+c3 = myMA150 < myMA200
+
+// Condition 4: 200 MA trending DOWN for at least 1 month
+c4 = myMA200 < myMA200_1mo
+
+// Condition 5: 50 MA BELOW 150 MA
+c5 = myMA50 < myMA150
+
+// Condition 6: 50 MA BELOW 200 MA
+c6 = myMA50 < myMA200
+
+// Condition 7: Price BELOW 50-day MA
+c7 = close < myMA50
+
+// Condition 8: Price at least 25% BELOW 52-week high
+c8 = close <= my52wkHigh * 0.75
+
+// Condition 9: Price within 25% of 52-week low
+c9 = close <= my52wkLow * 1.25
+
+// Note: RS ≤ 30 (condition 10) handled by Python orchestrator
+
+inverseTemplate = c1 AND c2 AND c3 AND c4 AND c5 AND c6 AND c7 AND c8 AND c9
+
+// ── GATE S2: ADX TREND STRENGTH ──────────────────────────────
+// Same threshold as longs — ADX > 25 confirms downtrend
+// has momentum, not just drift
+
+myADX = ADX[14]
+adxOK = myADX > 25
+
+// ── GATE S3: DISTRIBUTION EVIDENCE ───────────────────────────
+// O'Neil / Morales: ≥ 3 of last 10 sessions must be
+// distribution days (close DOWN on volume ≥ 1.25× average).
+// This is the footprint of institutional selling.
+
+avgVol = Average[50](Volume)
+heavyThreshold = avgVol * 1.25
+
+distCount = 0
+FOR i = 1 TO 10
+    IF close[i] < close[i + 1] AND Volume[i] >= heavyThreshold THEN
+        distCount = distCount + 1
+    ENDIF
+NEXT
+
+distributionOK = distCount >= 3
+
+// ── COMBINED SCAN ────────────────────────────────────────────
+
+allGates = inverseTemplate AND adxOK AND distributionOK
+
+SCREENER[allGates] (myADX AS "ADX", distCount AS "Dist Days", close AS "Price", myMA50 AS "MA50", my52wkLow AS "52wk Low")

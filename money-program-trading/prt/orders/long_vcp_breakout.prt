@@ -1,0 +1,88 @@
+// ════════════════════════════════════════════════════════════════
+// MONEY PROGRAM — VCP BREAKOUT ENTRY (Type L-A)
+// ProOrder Automated Trading System
+// ════════════════════════════════════════════════════════════════
+// Deploy: Per instrument identified by ProScreener
+// Timeframe: Daily bars (with 5-min companion for volume checks)
+//
+// This system handles:
+//   - Gate verification (re-checks at execution time)
+//   - Breakout detection above pivot
+//   - Volume confirmation
+//   - Entry with stop-loss
+//   - Trailing stop after 3:1 profit target
+//
+// Position sizing is calculated externally by the Python
+// orchestrator and passed as the contract size parameter.
+// ════════════════════════════════════════════════════════════════
+
+DEFPARAM CumulateOrders = false  // No pyramiding
+DEFPARAM PreLoadBars = 260       // Need 260 bars for 52-week data
+
+// ── INPUTS (set per instrument by orchestrator) ──────────────
+// pivotLevel is set when deploying the system
+// stopPct is the distance to stop as a fraction (e.g., 0.07 = 7%)
+
+ONCE pivotLevel = 0        // Set externally before deployment
+ONCE stopPct = 0.07        // Default 7% stop
+ONCE deployed = 0          // Set to 1 when ready to trade
+
+// ── GATE 1: TREND TEMPLATE ───────────────────────────────────
+myMA50 = Average[50](close)
+myMA150 = Average[150](close)
+myMA200 = Average[200](close)
+trendOK = close > myMA50 AND close > myMA150 AND close > myMA200
+trendOK = trendOK AND myMA50 > myMA150 AND myMA150 > myMA200
+trendOK = trendOK AND myMA200 > Average[200](close)[22]
+trendOK = trendOK AND close >= Lowest[260](low) * 1.25
+trendOK = trendOK AND close >= Highest[260](high) * 0.75
+
+// ── GATE 2: ADX ──────────────────────────────────────────────
+adxOK = ADX[14] > 25
+
+// ── GATE 3: VOLUME DRY-UP ───────────────────────────────────
+avgVol = Average[50](Volume)
+dryCount = 0
+FOR i = 1 TO 5
+    IF Volume[i] < avgVol * 0.60 THEN
+        dryCount = dryCount + 1
+    ENDIF
+NEXT
+volDryOK = dryCount >= 2
+
+// ── ALL GATES ────────────────────────────────────────────────
+allGates = trendOK AND adxOK AND volDryOK
+
+// ── BREAKOUT DETECTION ───────────────────────────────────────
+// Price must close above pivot on volume ≥ 1.4× average
+breakoutVol = Volume > avgVol * 1.40
+breakout = close > pivotLevel AND breakoutVol
+
+// ── CHASE PROTECTION ─────────────────────────────────────────
+// If price opened > 3% above pivot without a gap, skip
+openedTooHigh = open > pivotLevel * 1.03
+
+// ── ENTRY LOGIC ──────────────────────────────────────────────
+IF deployed = 1 AND allGates AND breakout AND NOT openedTooHigh AND NOT ONMARKET THEN
+    BUY 1 CONTRACT AT MARKET
+    SET STOP LOSS pivotLevel * stopPct
+ENDIF
+
+// ── TRAILING STOP AFTER 3:1 PROFIT ──────────────────────────
+// Once price has moved 3× the stop distance in our favour,
+// activate a trailing stop to lock in gains
+IF ONMARKET THEN
+    myRisk = POSITIONPRICE * stopPct
+    myTarget = POSITIONPRICE + (myRisk * 3)
+
+    IF close >= myTarget THEN
+        SET STOP TRAILING 3%
+    ENDIF
+ENDIF
+
+// ── SAFETY: AUTO-DISABLE AFTER ENTRY ─────────────────────────
+// This system fires once. After entry (or if the setup
+// deteriorates), the Python orchestrator removes it.
+IF ONMARKET THEN
+    deployed = 0  // Prevent re-entry
+ENDIF

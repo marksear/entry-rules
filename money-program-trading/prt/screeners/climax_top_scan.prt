@@ -1,0 +1,52 @@
+// ════════════════════════════════════════════════════════════════
+// MONEY PROGRAM — CLIMAX TOP REVERSAL SCAN (Rule S1-ALT)
+// ════════════════════════════════════════════════════════════════
+// Scans for the rare climax top reversal pattern (S-D entry).
+// This fires BEFORE the inverse template is established because
+// it catches the turn itself. All 5 conditions must be TRUE.
+//
+// This is intentionally rare — and that is by design.
+//
+// Deploy on: S&P 500, NASDAQ 100, FTSE 100, FTSE 250
+// Timeframe: Daily
+// ════════════════════════════════════════════════════════════════
+
+myMA200 = Average[200](close)
+
+// ── Condition 1: Stock advanced ≥ 100% in prior 8 weeks ──────
+// 40 trading days lookback
+lowPoint8wk = Lowest[40](low)
+advancePct = ((close - lowPoint8wk) / lowPoint8wk) * 100
+c1 = advancePct >= 100
+
+// ── Condition 2: Widest daily range in the entire advance ────
+todayRange = high - low
+maxRange40 = Highest[40](high - low)
+c2 = todayRange >= maxRange40
+
+// ── Condition 3: Highest volume day in the entire advance ────
+maxVol40 = Highest[40](Volume)
+c3 = Volume >= maxVol40
+
+// ── Condition 4: Reversal candle — closes in lower 25% ──────
+// of the day's range. This is the exhaustion signal.
+IF todayRange > 0 THEN
+    closePosition = (close - low) / todayRange
+ELSE
+    closePosition = 0.5
+ENDIF
+c4 = closePosition <= 0.25
+
+// ── Condition 5: Extended ≥ 50% above 200-day MA ─────────────
+// This confirms the stock is in blowoff territory
+IF myMA200 > 0 THEN
+    extensionPct = ((close / myMA200) - 1) * 100
+ELSE
+    extensionPct = 0
+ENDIF
+c5 = extensionPct >= 50
+
+// ── COMBINED SCAN ────────────────────────────────────────────
+allConditions = c1 AND c2 AND c3 AND c4 AND c5
+
+SCREENER[allConditions] (advancePct AS "Advance %", extensionPct AS "Ext above 200MA %", Volume AS "Volume", closePosition AS "Close Pos in Range")

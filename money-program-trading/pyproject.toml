@@ -1,0 +1,58 @@
+[project]
+name = "money-program-trading"
+version = "0.1.0"
+description = "Money Program Trading Program — Entry Refinement Engine"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
+
+dependencies = [
+    "trading-ig>=0.0.25",       # IG Index REST + Lightstreamer
+    "pandas>=2.0",              # Data manipulation, bar history
+    "numpy>=1.24",              # Indicator calculations
+    "requests>=2.31",           # HTTP calls (supplementary APIs)
+    "python-dotenv>=1.0",       # Environment variable management
+    "pydantic>=2.0",            # Settings validation, data models
+    "schedule>=1.2",            # Lightweight task scheduling
+    "tenacity>=8.2",            # Retry logic for API calls
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1",                # Linting
+    "mypy>=1.5",                # Type checking
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+# UP042: `(str, Enum)` is the established convention across this codebase and
+# provides the best-compatible behaviour for Pydantic v2 + SQLite/Parquet
+# serialisation (values stored as plain strings). StrEnum (3.11+) would work
+# but the migration is a separate task; ignoring keeps the codebase consistent.
+ignore = ["UP042"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "integration: hits IG DEMO live. Skipped automatically when IG_USERNAME is unset. Run with 'pytest -m integration' to opt-in.",
+    "unit: in-process tests that never hit IG (synthetic snapshots + mock broker).",
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true

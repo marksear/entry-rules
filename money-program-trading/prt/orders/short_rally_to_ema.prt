@@ -1,0 +1,78 @@
+// ════════════════════════════════════════════════════════════════
+// MONEY PROGRAM — RALLY INTO RESISTANCE / EMA (Type S-B)
+// ProOrder Automated Trading System
+// ════════════════════════════════════════════════════════════════
+// Raschke / Livermore (short-side): When a breakdown has occurred
+// and we missed the initial entry, the first rally back to the
+// declining 10 or 20 EMA is the secondary short entry.
+//
+// Deploy: Per instrument that has already broken down
+// Timeframe: Daily bars
+// ════════════════════════════════════════════════════════════════
+
+DEFPARAM CumulateOrders = false
+DEFPARAM PreLoadBars = 260
+
+ONCE deployed = 0
+ONCE stopPct = 0.07
+
+// ── GATE RE-CHECK ────────────────────────────────────────────
+myMA50 = Average[50](close)
+myMA150 = Average[150](close)
+myMA200 = Average[200](close)
+invTrend = close < myMA50 AND close < myMA150 AND close < myMA200
+invTrend = invTrend AND myMA50 < myMA150 AND myMA150 < myMA200
+adxOK = ADX[14] > 25
+
+allGates = invTrend AND adxOK
+
+// ── DECLINING EMA DETECTION ──────────────────────────────────
+myEMA10 = ExponentialAverage[10](close)
+myEMA20 = ExponentialAverage[20](close)
+
+// Confirm the EMAs are actually declining (not flattening)
+ema10Declining = myEMA10 < myEMA10[5]
+ema20Declining = myEMA20 < myEMA20[5]
+
+// ── RALLY TO EMA TOUCH ───────────────────────────────────────
+// Price rallying UP to touch the declining EMA
+touchEMA10 = high >= myEMA10 * 0.995 AND high <= myEMA10 * 1.005
+touchEMA20 = high >= myEMA20 * 0.995 AND high <= myEMA20 * 1.005
+touchingEMA = (touchEMA10 AND ema10Declining) OR (touchEMA20 AND ema20Declining)
+
+// ── DECLINING VOLUME DURING RALLY ────────────────────────────
+// Weak, corrective rally = declining volume (no buying conviction)
+volDeclining = Volume < Volume[1] AND Volume[1] < Volume[2]
+
+// ── ENTRY TRIGGER ────────────────────────────────────────────
+// Sell-stop below the low of the first candle that touches the EMA
+touchBarLow = low[1]
+yesterdayTouched = (touchEMA10[1] AND ema10Declining[1]) OR (touchEMA20[1] AND ema20Declining[1])
+
+// Rally must have failed — price didn't close above the EMA
+rallyFailed = close[1] <= MAX(myEMA10[1], myEMA20[1]) * 1.01
+
+IF deployed = 1 AND allGates AND yesterdayTouched AND volDeclining AND rallyFailed AND NOT SHORTONMARKET THEN
+    IF close < touchBarLow THEN
+        SELLSHORT 1 CONTRACT AT MARKET
+        // Stop above the swing high of the rally
+        swingHigh = Highest[10](high)
+        SET STOP LOSS (swingHigh - close + close * 0.01)
+    ENDIF
+ENDIF
+
+// ── TRAILING STOP + EMERGENCY COVER ──────────────────────────
+IF SHORTONMARKET THEN
+    swingHigh = Highest[10](high)
+    myRisk = swingHigh - POSITIONPRICE
+    IF myRisk > 0 AND close <= POSITIONPRICE - (myRisk * 3) THEN
+        SET STOP TRAILING 3%
+    ENDIF
+
+    // Emergency cover at 15% adverse
+    IF close >= POSITIONPRICE * 1.15 THEN
+        EXITSHORT AT MARKET
+    ENDIF
+
+    deployed = 0
+ENDIF

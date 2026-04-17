@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "scan_record": {
+    "scan_id": "67af5a2a-ed76-4b3c-8e52-97190fdc0ca5",
+    "session_id": null,
+    "scanned_at_utc": "2026-04-17T08:23:10.354594",
+    "universe_size": 2,
+    "broker_mode": "DEMO",
+    "regime": {
+      "regime": "GREEN",
+      "regime_score": null,
+      "vix_level": null,
+      "breadth_us": null,
+      "breadth_uk": null,
+      "notes": "shakedown fixture \u2014 no MCL run"
+    },
+    "scored_universe": [
+      {
+        "symbol": "SPTRD",
+        "market": "US",
+        "price": 5800.0,
+        "currency": "GBP",
+        "pillar_pass_count": 0,
+        "pillar_bitmap": 0,
+        "day1_score": null,
+        "day1_tier": null,
+        "grade": "B",
+        "shortlisted": true,
+        "rejection_reason": null,
+        "rejection_code": null
+      },
+      {
+        "symbol": "NASDAQ",
+        "market": "US",
+        "price": 20000.0,
+        "currency": "GBP",
+        "pillar_pass_count": 0,
+        "pillar_bitmap": 0,
+        "day1_score": null,
+        "day1_tier": null,
+        "grade": "B",
+        "shortlisted": true,
+        "rejection_reason": null,
+        "rejection_code": null
+      }
+    ],
+    "scanner_version": "shakedown",
+    "rule_set_version": "",
+    "schema_version": 1,
+    "extras": {}
+  },
+  "shortlist_entries": [
+    {
+      "candidate_id": "bcd3af10-114c-4c52-9834-cf213fb71edb",
+      "scan_id": "67af5a2a-ed76-4b3c-8e52-97190fdc0ca5",
+      "session_id": null,
+      "symbol": "SPTRD",
+      "market": "US",
+      "direction": "LONG",
+      "setup_type": "L-A",
+      "grade": "B",
+      "trigger_low": 5802.0,
+      "trigger_high": 5803.0,
+      "stop_price": 5797.0,
+      "target_price": null,
+      "planned_stake_gbp_per_pt": 0.5,
+      "planned_risk_gbp": 2.5,
+      "planned_risk_pct_account": 0.00025,
+      "pillar_votes": {
+        "livermore": false,
+        "oneil": false,
+        "minervini": false,
+        "darvas": false,
+        "raschke": false,
+        "weinstein": false
+      },
+      "committee_stance": "shakedown",
+      "day1_score": null,
+      "day1_tier": null,
+      "broker_mode": "DEMO",
+      "created_at_utc": "2026-04-17T08:23:10.354558",
+      "schema_version": 1,
+      "rule_set_version": "",
+      "extras": {},
+      "notes": "session-8 shakedown: spot=5800.0, risk_pts=5.0"
+    },
+    {
+      "candidate_id": "d8bd0a1e-33cd-472e-858a-c3e2b7bac4f2",
+      "scan_id": "67af5a2a-ed76-4b3c-8e52-97190fdc0ca5",
+      "session_id": null,
+      "symbol": "NASDAQ",
+      "market": "US",
+      "direction": "LONG",
+      "setup_type": "L-A",
+      "grade": "B",
+      "trigger_low": 20005.0,
+      "trigger_high": 20006.0,
+      "stop_price": 19990.0,
+      "target_price": null,
+      "planned_stake_gbp_per_pt": 0.5,
+      "planned_risk_gbp": 7.5,
+      "planned_risk_pct_account": 0.00075,
+      "pillar_votes": {
+        "livermore": false,
+        "oneil": false,
+        "minervini": false,
+        "darvas": false,
+        "raschke": false,
+        "weinstein": false
+      },
+      "committee_stance": "shakedown",
+      "day1_score": null,
+      "day1_tier": null,
+      "broker_mode": "DEMO",
+      "created_at_utc": "2026-04-17T08:23:10.354587",
+      "schema_version": 1,
+      "rule_set_version": "",
+      "extras": {},
+      "notes": "session-8 shakedown: spot=20000.0, risk_pts=15.0"
+    }
+  ]
+}

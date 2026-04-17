@@ -1,0 +1,67 @@
+// ════════════════════════════════════════════════════════════════
+// MONEY PROGRAM — FIRST PULLBACK TO EMA ENTRY (Type L-B)
+// ProOrder Automated Trading System
+// ════════════════════════════════════════════════════════════════
+// Raschke / Livermore: When a breakout has already occurred and
+// we missed the pivot, the first pullback to the 10 or 20 EMA
+// becomes the secondary entry.
+//
+// Deploy: Per instrument that has already broken out
+// Timeframe: Daily bars
+// ════════════════════════════════════════════════════════════════
+
+DEFPARAM CumulateOrders = false
+DEFPARAM PreLoadBars = 260
+
+ONCE deployed = 0
+ONCE stopPct = 0.07
+
+// ── GATE RE-CHECK ────────────────────────────────────────────
+myMA50 = Average[50](close)
+myMA150 = Average[150](close)
+myMA200 = Average[200](close)
+trendOK = close > myMA50 AND close > myMA150 AND close > myMA200
+trendOK = trendOK AND myMA50 > myMA150 AND myMA150 > myMA200
+adxOK = ADX[14] > 25
+
+allGates = trendOK AND adxOK
+
+// ── EMA TOUCH DETECTION ─────────────────────────────────────
+myEMA10 = ExponentialAverage[10](close)
+myEMA20 = ExponentialAverage[20](close)
+
+// Price touching the EMA = low of the day reaches within 0.5% of EMA
+touchEMA10 = low <= myEMA10 * 1.005 AND low >= myEMA10 * 0.995
+touchEMA20 = low <= myEMA20 * 1.005 AND low >= myEMA20 * 0.995
+touchingEMA = touchEMA10 OR touchEMA20
+
+// ── DECLINING VOLUME DURING PULLBACK ─────────────────────────
+// Each session's volume should be lower than prior (weak pullback)
+volDeclining = Volume < Volume[1] AND Volume[1] < Volume[2]
+
+// ── ENTRY TRIGGER ────────────────────────────────────────────
+// Buy-stop above the high of the first candle that touches EMA
+// We enter on the NEXT bar after the touch, above the touch bar's high
+touchBarHigh = high[1]  // Yesterday's high (the touch bar)
+yesterdayTouched = touchEMA10[1] OR touchEMA20[1]
+
+// The pullback must hold — price didn't close below the EMA
+pullbackHeld = close[1] >= MIN(myEMA10[1], myEMA20[1]) * 0.99
+
+IF deployed = 1 AND allGates AND yesterdayTouched AND volDeclining AND pullbackHeld AND NOT ONMARKET THEN
+    IF close > touchBarHigh THEN
+        BUY 1 CONTRACT AT MARKET
+        // Stop below the swing low of the pullback
+        swingLow = Lowest[10](low)
+        SET STOP LOSS (close - swingLow + close * 0.01)
+    ENDIF
+ENDIF
+
+// ── TRAILING STOP ────────────────────────────────────────────
+IF ONMARKET THEN
+    myRisk = POSITIONPRICE - Lowest[10](low)
+    IF myRisk > 0 AND close >= POSITIONPRICE + (myRisk * 3) THEN
+        SET STOP TRAILING 3%
+    ENDIF
+    deployed = 0
+ENDIF
