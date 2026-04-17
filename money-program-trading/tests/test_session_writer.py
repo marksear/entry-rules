@@ -219,7 +219,7 @@ def test_session_open_inserts_row(database: Database):
         assert row["opened_at_utc"] is not None
         assert row["closed_at_utc"] is None
         assert row["rule_set_version"] == "abc1234"
-        assert row["schema_version"] == 1
+        assert row["schema_version"] == 2
 
 
 def test_session_close_stamps_closed_at(database: Database):
@@ -732,3 +732,132 @@ def test_foreign_key_enforced(database: Database):
             ),
         )
         database.conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# v1 ↔ v2 ingest compatibility (ig_price_grounding_spec.md §7)
+# ---------------------------------------------------------------------------
+
+
+def _v2_scan_payload(*, with_anchor_fields: bool, with_emission_rejections: bool) -> dict:
+    """Build a minimal scan handoff dict.
+
+    ``with_anchor_fields=False`` simulates a v1 (pre-grounding) scan: the new
+    ShortlistEntry fields and the ScanRecord.emission_rejections key are
+    absent from the JSON entirely (not just None). Both shapes must ingest
+    without error.
+    """
+    scan = ScanRecord(
+        scanned_at_utc=datetime(2026, 4, 17, 13, 30, 0),
+        universe_size=1,
+        broker_mode=BrokerMode.DEMO,
+        regime=RegimeSnapshot(regime=RegimeState.GREEN),
+        scored_universe=[
+            UniverseScoreEntry(
+                symbol="OXY",
+                market="US",
+                price=62.40,
+                currency="USD",
+                pillar_pass_count=5,
+                pillar_bitmap=0b011111,
+                grade="A",
+                shortlisted=True,
+            ),
+        ],
+    )
+    entry_kwargs: dict = dict(
+        scan_id=scan.scan_id,
+        symbol="OXY",
+        market=Market.US,
+        direction=Direction.LONG,
+        setup_type=EntryType.L_A,
+        grade=CandidateGrade.A,
+        trigger_low=62.40,
+        trigger_high=62.55,
+        stop_price=60.10,
+        target_price=67.0,
+        planned_stake_gbp_per_pt=0.10,
+        planned_risk_gbp=0.23,
+        planned_risk_pct_account=0.0075,
+        broker_mode=BrokerMode.DEMO,
+    )
+    if with_anchor_fields:
+        entry_kwargs.update(
+            price_source="yahoo_chart",
+            price_as_of_utc=datetime(2026, 4, 17, 14, 32, 1),
+            reference_last_traded=62.50,
+        )
+    entry = ShortlistEntry(**entry_kwargs)
+
+    scan_dict = scan.model_dump(mode="json")
+    entry_dict = entry.model_dump(mode="json")
+
+    if not with_anchor_fields:
+        # Strip the v2-only keys to make this look like a true v1 scan
+        # written by an older swing-committee build.
+        for k in ("price_source", "price_as_of_utc", "reference_last_traded"):
+            entry_dict.pop(k, None)
+        scan_dict.pop("emission_rejections", None)
+    elif with_emission_rejections:
+        scan_dict["emission_rejections"] = [
+            {
+                "symbol": "AMD",
+                "direction": "LONG",
+                "grade": "A",
+                "reason": "DRIFT_OVER_THRESHOLD",
+                "llm_trigger_mid": 139.00,
+                "reference_last_traded": 155.42,
+                "drift_pct": 0.106,
+                "price_source": "yahoo_chart",
+                "price_as_of_utc": "2026-04-17T14:32:01Z",
+            }
+        ]
+
+    return {
+        "schema_version": 2 if with_anchor_fields else 1,
+        "scan_record": scan_dict,
+        "shortlist_entries": [entry_dict],
+    }
+
+
+def _write_payload(tmp_path: Path, payload: dict) -> Path:
+    path = tmp_path / "scan.json"
+    path.write_text(json.dumps(payload, default=str), encoding="utf-8")
+    return path
+
+
+def test_ingest_accepts_v1_scan_without_anchor_fields(database: Database, tmp_path: Path):
+    payload = _v2_scan_payload(with_anchor_fields=False, with_emission_rejections=False)
+    scan_path = _write_payload(tmp_path, payload)
+    with SessionWriter(
+        database,
+        broker_mode=BrokerMode.DEMO,
+        session_label=SessionLabel.US_REGULAR,
+        account_size_gbp=1000.0,
+        rule_set_version="abc1234",
+    ) as writer:
+        scan_id = writer.ingest_scan(scan_path)
+        assert scan_id
+        # No emission rejections were emitted by the (pre-grounding) scanner.
+        assert writer.emission_rejections == []
+
+
+def test_ingest_accepts_v2_scan_with_anchor_fields(database: Database, tmp_path: Path):
+    payload = _v2_scan_payload(with_anchor_fields=True, with_emission_rejections=True)
+    scan_path = _write_payload(tmp_path, payload)
+    with SessionWriter(
+        database,
+        broker_mode=BrokerMode.DEMO,
+        session_label=SessionLabel.US_REGULAR,
+        account_size_gbp=1000.0,
+        rule_set_version="abc1234",
+    ) as writer:
+        scan_id = writer.ingest_scan(scan_path)
+        assert scan_id
+        # emission_rejections are surfaced on the writer for session_init's
+        # summary line.
+        assert len(writer.emission_rejections) == 1
+        rej = writer.emission_rejections[0]
+        assert rej.symbol == "AMD"
+        assert rej.reason == "DRIFT_OVER_THRESHOLD"
+        assert rej.price_source == "yahoo_chart"

@@ -52,6 +52,7 @@ def _make_entry(
     setup_type: EntryType = EntryType.L_A,
     grade: CandidateGrade = CandidateGrade.A_PLUS,
     market: Market = Market.US,
+    price_source: str | None = None,
 ) -> ShortlistEntry:
     """Build a minimal valid ShortlistEntry for anchoring tests."""
     return ShortlistEntry(
@@ -68,6 +69,7 @@ def _make_entry(
         planned_risk_gbp=5.0,
         planned_risk_pct_account=0.01,
         broker_mode=BrokerMode.DEMO,
+        price_source=price_source,
     )
 
 
@@ -359,6 +361,85 @@ def test_anchor_empty_input_returns_empty_report():
     assert report.accepted_count == 0
     assert report.rejected_count == 0
     assert "no entries" in report.summary_line()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Source-aware drift threshold (ig_price_grounding_spec.md §7)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_anchor_uses_default_threshold_for_legacy_v1_entry():
+    """price_source=None (legacy v1 scan) keeps the caller-supplied default."""
+    # midpoint=100, ig=108 → 8% drift. Inside the 15% default, outside a 5% cap.
+    entry = _make_entry(
+        trigger_low=98.0, trigger_high=102.0, stop_price=95.0, price_source=None
+    )
+    md = FakeMarketData(
+        epic_map={"AMD": "SA.D.AMD.DAILY.IP"},
+        snapshots={"SA.D.AMD.DAILY.IP": {"last_traded": 108.0}},
+    )
+
+    report = anchor_shortlist_to_ig([entry], md)  # default 15%
+    assert report.accepted_count == 1
+
+
+def test_anchor_widens_to_15pct_for_yahoo_chart_entry():
+    """yahoo_chart-anchored entries always get the 15% band, even if the
+    caller passes a stricter default — the wider band absorbs Yahoo↔IG
+    divergence by design."""
+    entry = _make_entry(
+        trigger_low=98.0,
+        trigger_high=102.0,
+        stop_price=95.0,
+        price_source="yahoo_chart",
+    )
+    md = FakeMarketData(
+        epic_map={"AMD": "SA.D.AMD.DAILY.IP"},
+        snapshots={"SA.D.AMD.DAILY.IP": {"last_traded": 108.0}},  # 8% drift
+    )
+
+    # Caller passes a tight 5% default; yahoo_chart override widens to 15%.
+    report = anchor_shortlist_to_ig([entry], md, max_drift_pct=0.05)
+    assert report.accepted_count == 1
+    assert report.results[0].reason == "ok"
+
+
+def test_anchor_tightens_to_5pct_for_ig_snapshot_entry():
+    """ig_snapshot-anchored entries share execution's data fence, so we
+    enforce the 5% band even if the caller's default is looser."""
+    entry = _make_entry(
+        trigger_low=98.0,
+        trigger_high=102.0,
+        stop_price=95.0,
+        price_source="ig_snapshot",
+    )
+    md = FakeMarketData(
+        epic_map={"AMD": "SA.D.AMD.DAILY.IP"},
+        snapshots={"SA.D.AMD.DAILY.IP": {"last_traded": 108.0}},  # 8% drift
+    )
+
+    # Even with a generous 15% default, ig_snapshot override clamps to 5%.
+    report = anchor_shortlist_to_ig([entry], md, max_drift_pct=0.15)
+    assert report.accepted_count == 0
+    assert report.results[0].reason == "drift_too_high"
+
+
+def test_anchor_uses_caller_default_for_unknown_price_source():
+    """An unknown price_source string falls back to the caller's default
+    rather than silently picking a hardcoded number."""
+    entry = _make_entry(
+        trigger_low=98.0,
+        trigger_high=102.0,
+        stop_price=95.0,
+        price_source="finnhub",
+    )
+    md = FakeMarketData(
+        epic_map={"AMD": "SA.D.AMD.DAILY.IP"},
+        snapshots={"SA.D.AMD.DAILY.IP": {"last_traded": 108.0}},
+    )
+    # Caller default 5% → drift 8% rejects.
+    tight = anchor_shortlist_to_ig([entry], md, max_drift_pct=0.05)
+    assert tight.accepted_count == 0
 
 
 def test_anchor_result_dataclass_round_trips_basic_fields():

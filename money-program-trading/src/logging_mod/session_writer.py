@@ -120,6 +120,11 @@ class SessionWriter:
         self.gate_bypass: bool = False
         self.bypass_until: date | None = None
         self.bypass_candidate_count: int = 0
+        # Populated by ingest_scan() from scan_record.emission_rejections.
+        # session_init reads these to log a summary line alongside the
+        # ingest-side scan_anchor rejections — see
+        # docs/ig_price_grounding_spec.md §7.
+        self.emission_rejections: list = []
         self._opened_at: datetime | None = None
         self._closed = False
 
@@ -360,6 +365,7 @@ class SessionWriter:
         self.gate_bypass = scan.gate_bypass
         self.bypass_until = scan.bypass_until
         self.bypass_candidate_count = len(entries)
+        self.emission_rejections = list(scan.emission_rejections or [])
         logger.info(
             "Scan ingested: scan_id=%s universe=%d shortlist=%d",
             scan.scan_id,

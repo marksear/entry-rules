@@ -60,6 +60,23 @@ logger = logging.getLogger(__name__)
 # Default drift threshold. Configurable via Settings.price_anchor_max_drift_pct.
 DEFAULT_MAX_DRIFT_PCT: float = 0.15
 
+# Source-aware drift overrides. v2 scans carry ``ShortlistEntry.price_source``
+# telling us how the LLM levels were anchored at emission. IG-anchored levels
+# share execution's data fence so we can be much stricter; Yahoo-anchored
+# levels need the wider band to absorb Yahoo↔IG divergence. Legacy v1 scans
+# (price_source is None) get the caller-supplied default.
+# See docs/ig_price_grounding_spec.md §7.
+_DRIFT_BY_SOURCE: dict[str, float] = {
+    "yahoo_chart": 0.15,
+    "ig_snapshot": 0.05,
+}
+
+
+def _drift_threshold_for(price_source: str | None, default: float) -> float:
+    if price_source is None:
+        return default
+    return _DRIFT_BY_SOURCE.get(price_source, default)
+
 
 @dataclass
 class AnchorResult:
@@ -187,6 +204,7 @@ def anchor_shortlist_to_ig(
     results: list[AnchorResult] = []
     for entry in entries:
         scan_price = _scan_reference_price(entry)
+        entry_max_drift = _drift_threshold_for(entry.price_source, max_drift_pct)
         result = AnchorResult(
             entry=entry,
             accepted=False,
@@ -253,7 +271,7 @@ def anchor_shortlist_to_ig(
         result.ig_last_price = float(ig_last)
 
         # ── 3. Classify drift ────────────────────────────────────────
-        accept, drift = _classify_drift(scan_price, float(ig_last), max_drift_pct)
+        accept, drift = _classify_drift(scan_price, float(ig_last), entry_max_drift)
         result.drift_pct = drift
 
         if accept:
@@ -269,7 +287,8 @@ def anchor_shortlist_to_ig(
             result.reason = "drift_too_high"
             result.notes = (
                 f"scan_ref={scan_price:.2f} vs ig_last={ig_last:.2f} "
-                f"(drift={drift*100:.2f}% > max {max_drift_pct*100:.0f}%)"
+                f"(drift={drift*100:.2f}% > max {entry_max_drift*100:.2f}%, "
+                f"source={entry.price_source!r})"
             )
             logger.warning(
                 "anchor: %s REJECTED — %s", entry.symbol, result.notes

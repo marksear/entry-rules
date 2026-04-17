@@ -56,7 +56,7 @@ def test_session_record_roundtrip():
     restored = SessionRecord.model_validate_json(rec.model_dump_json())
     assert restored == rec
     # Schema version must be stamped.
-    assert restored.schema_version == 1
+    assert restored.schema_version == 2
 
 
 def test_session_record_requires_broker_mode():

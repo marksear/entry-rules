@@ -107,6 +107,26 @@ class ShortlistEntry(BaseModel):
     day1_score: float | None = None
     day1_tier: str | None = None
 
+    # Price grounding (v2; nullable for v1 back-compat). Populated by
+    # swing-committee's emission-side anchor pass — see
+    # docs/ig_price_grounding_spec.md §5.1. Drives the source-aware drift
+    # threshold in src/engine/scan_anchor.py.
+    price_source: str | None = Field(
+        default=None,
+        description=(
+            'Provenance of reference_last_traded: "yahoo_chart" | "ig_snapshot" '
+            '| "finnhub" | "none" | None (legacy v1 scan).'
+        ),
+    )
+    price_as_of_utc: datetime | None = Field(
+        default=None,
+        description="UTC timestamp of the reference quote at emission time.",
+    )
+    reference_last_traded: float | None = Field(
+        default=None,
+        description="Reference last-traded price the LLM levels were anchored to.",
+    )
+
     # Provenance
     broker_mode: BrokerMode
     created_at_utc: datetime = Field(default_factory=datetime.utcnow)

@@ -352,6 +352,30 @@ def run(args: argparse.Namespace) -> int:
                 scan_id = writer.ingest_scan(scan_path, market_data=market_data)
                 logger.info("Scan ingested: scan_id=%s", scan_id)
 
+                # Emission-side rejections are produced by swing-committee's
+                # price-anchor pass at scan-build time (see
+                # docs/ig_price_grounding_spec.md §5.2). They are distinct
+                # from the ingest-side scan_anchor rejections logged inside
+                # ingest_scan above; surface both so a steady-state DEMO
+                # run shows the two rejection surfaces separately.
+                emission_rejections = writer.emission_rejections
+                if emission_rejections:
+                    by_reason: dict[str, int] = {}
+                    for r in emission_rejections:
+                        by_reason[r.reason] = by_reason.get(r.reason, 0) + 1
+                    breakdown = ", ".join(
+                        f"{k}={v}" for k, v in sorted(by_reason.items())
+                    )
+                    logger.info(
+                        "Emission-side rejections: %d (%s)",
+                        len(emission_rejections),
+                        breakdown,
+                    )
+                else:
+                    logger.info(
+                        "Emission-side rejections: 0 (none reported by swing-committee)"
+                    )
+
                 # If the scan was curated under gate_bypass, stamp a prominent
                 # session-level event so the journal can't miss it. No-op when
                 # bypass is off, so safe to call unconditionally.

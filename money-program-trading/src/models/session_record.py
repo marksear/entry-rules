@@ -14,9 +14,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .log_enums import BrokerMode, SessionLabel
 
-LOG_SCHEMA_VERSION = 1
+LOG_SCHEMA_VERSION = 2
 """Observability log schema version. Bump on any breaking change to the five
 log record models below. Old rows remain readable — queries partition on this.
+
+v2 (2026-04-17): adds optional price-grounding fields on ShortlistEntry
+(``price_source``, ``price_as_of_utc``, ``reference_last_traded``) and an
+optional ``emission_rejections`` array on ScanRecord. v1 scans (no anchor
+fields) still ingest cleanly — all new fields are nullable.
 """
 
 

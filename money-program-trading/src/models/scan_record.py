@@ -81,6 +81,30 @@ class UniverseScoreEntry(BaseModel):
     )
 
 
+class EmissionRejection(BaseModel):
+    """One shortlist entry dropped by swing-committee's emission-side
+    price-anchor pass. The counterpart to ``scan_anchor`` ingest-side
+    rejections — see docs/ig_price_grounding_spec.md §5.2.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str
+    direction: str
+    grade: str
+    reason: str = Field(
+        description=(
+            "DRIFT_OVER_THRESHOLD | NO_REFERENCE_QUOTE | STALE_QUOTE | "
+            "CURRENCY_MISMATCH"
+        )
+    )
+    llm_trigger_mid: float | None = None
+    reference_last_traded: float | None = None
+    drift_pct: float | None = None
+    price_source: str | None = None
+    price_as_of_utc: datetime | None = None
+
+
 class ScanRecord(BaseModel):
     """One row per morning scan. Emitted by swing-committee.
 
@@ -147,6 +171,15 @@ class ScanRecord(BaseModel):
         description=(
             "Expiry date (UTC) for gate_bypass. session_init refuses to ingest "
             "a bypass scan after this date. Required if gate_bypass=True."
+        ),
+    )
+
+    emission_rejections: list[EmissionRejection] | None = Field(
+        default=None,
+        description=(
+            "Entries dropped by swing-committee's emission-side anchor pass. "
+            "None = pre-grounding (v1) scan; [] = grounding ran with no drops. "
+            "Counterpart to scan_anchor's ingest-side rejections."
         ),
     )
 

@@ -38,7 +38,7 @@ from .log_enums import (
 )
 from .order_instruction import OrderInstruction, OrderType, Tranche
 from .position import Position
-from .scan_record import RegimeSnapshot, ScanRecord, UniverseScoreEntry
+from .scan_record import EmissionRejection, RegimeSnapshot, ScanRecord, UniverseScoreEntry
 from .session_record import LOG_SCHEMA_VERSION, SessionRecord
 from .shortlist_entry import PillarVotes, ShortlistEntry
 
@@ -56,7 +56,7 @@ __all__ = [
     # Log record types
     "LOG_SCHEMA_VERSION",
     "SessionRecord",
-    "RegimeSnapshot", "ScanRecord", "UniverseScoreEntry",
+    "EmissionRejection", "RegimeSnapshot", "ScanRecord", "UniverseScoreEntry",
     "PillarVotes", "ShortlistEntry",
     "CandidateSnapshot",
     "CandidateEvent", "EventPayload",
