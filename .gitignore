@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+money-program-trading/data/*.db
+money-program-trading/data/*.db-journal
+money-program-trading/reports/*.md
+.DS_Store
