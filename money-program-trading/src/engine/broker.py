@@ -34,11 +34,15 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from trading_ig.rest import IGException
 
 from ..auth.ig_auth import IGSession
 from ..models.common import Direction
+
+if TYPE_CHECKING:
+    from ..data.market_data import MarketData
 
 logger = logging.getLogger(__name__)
 
@@ -105,14 +109,37 @@ class CloseResult:
 
 
 class Broker:
-    """Narrow IG REST surface used by the MonitorLoop fill/exit paths."""
+    """Narrow IG REST surface used by the MonitorLoop fill/exit paths.
 
-    def __init__(self, session: IGSession):
+    When ``market_data`` is supplied, all price-unit arguments passed to
+    IG (``stop_level``, ``stop_distance``, ``limit_level``) are rescaled
+    from scan units (e.g., USD dollars) into IG's quoted units (e.g.,
+    cents for ×100 epics) using
+    :meth:`MarketData.to_ig_units`. Without a ``market_data`` the broker
+    behaves as before — suitable for unit tests that mock at the
+    trading_ig layer directly.
+    """
+
+    def __init__(
+        self,
+        session: IGSession,
+        market_data: "MarketData | None" = None,
+    ):
         self._session = session
+        self._market_data = market_data
 
     @property
     def ig(self):
         return self._session.service
+
+    def _to_ig(self, epic: str, value: float | None) -> float | None:
+        """Scale a scan-unit price into IG quoted units for ``epic``.
+
+        Returns ``value`` unchanged when no MarketData is attached —
+        preserves pre-2026-04-17 behaviour for unit tests."""
+        if self._market_data is None or value is None:
+            return value
+        return self._market_data.to_ig_units(epic, value)
 
     # ------------------------------------------------------------------
     # Open a new spread-bet position at market
@@ -139,6 +166,25 @@ class Broker:
         ig_direction = _ig_direction(direction)
         expiry = _expiry_for_epic(epic)
 
+        # Scale every price-unit argument from scan units into IG's
+        # quoted units for this epic. stop_distance is a delta in the
+        # same units as price so it scales identically to stop_level.
+        ig_stop_level = self._to_ig(epic, stop_price)
+        ig_stop_distance = self._to_ig(epic, stop_distance)
+        ig_limit_level = self._to_ig(epic, limit_level)
+        if self._market_data is not None:
+            scale = self._market_data.get_scaling_factor(epic)
+            if scale != 1.0:
+                logger.info(
+                    "Broker: scaling %s levels ×%.4g → stop_level=%s "
+                    "stop_distance=%s limit_level=%s",
+                    epic,
+                    scale,
+                    ig_stop_level,
+                    ig_stop_distance,
+                    ig_limit_level,
+                )
+
         kwargs = dict(
             currency_code="GBP",
             direction=ig_direction,
@@ -151,10 +197,10 @@ class Broker:
             trailing_stop=False,
             level=None,
             limit_distance=None,
-            limit_level=limit_level,
+            limit_level=ig_limit_level,
             quote_id=None,
-            stop_distance=stop_distance,
-            stop_level=stop_price,
+            stop_distance=ig_stop_distance,
+            stop_level=ig_stop_level,
             time_in_force="EXECUTE_AND_ELIMINATE",
             trailing_stop_increment=None,
         )
@@ -204,12 +250,22 @@ class Broker:
         deal_status = (confirm.get("dealStatus") or "").upper()
         reason = (confirm.get("reason") or "").upper()
         ok = deal_status in ("ACCEPTED", "OPENED") or reason == "SUCCESS"
-        fill_price = confirm.get("level")
+        # IG returns ``level`` in its quoted units; convert back to scan
+        # units so the monitor stores a fill_price directly comparable
+        # with plan.stop_price / trigger levels.
+        raw_fill = confirm.get("level")
+        fill_price: float | None = None
+        if raw_fill is not None:
+            fill_price = float(raw_fill)
+            if self._market_data is not None:
+                scale = self._market_data.get_scaling_factor(epic)
+                if scale and scale != 1.0:
+                    fill_price = fill_price / scale
         return OrderResult(
             success=ok,
             deal_reference=deal_reference,
             deal_id=confirm.get("dealId", ""),
-            fill_price=float(fill_price) if fill_price is not None else None,
+            fill_price=fill_price,
             stake_gbp_per_pt=size,
             stop_price=stop_price,
             deal_status=deal_status,
@@ -221,17 +277,31 @@ class Broker:
     # Move the stop on an open position
     # ------------------------------------------------------------------
 
-    def modify_stop(self, deal_id: str, new_stop_price: float) -> StopModifyResult:
+    def modify_stop(
+        self,
+        deal_id: str,
+        new_stop_price: float,
+        *,
+        epic: str | None = None,
+    ) -> StopModifyResult:
         """Update the stop-level on an open IG position.
 
         IG's REST update endpoint takes stop-level in price (not distance) so
         the ``new_stop_price`` we compute from the trail ladder is passed
-        through directly.
+        through after scaling into IG quoted units for ``epic``.
+
+        ``epic`` is keyword-only and optional to keep existing MockBroker /
+        unit-test callers working without churn. In production the
+        MonitorLoop passes ``epic=plan.ig_epic`` so the scaling factor is
+        applied; omitted ``epic`` = no scaling, same as pre-2026-04-17.
         """
+        ig_stop_level: float = (
+            self._to_ig(epic, new_stop_price) if epic else new_stop_price
+        )
         try:
             resp = self.ig.update_open_position(
                 limit_level=None,
-                stop_level=new_stop_price,
+                stop_level=ig_stop_level,
                 deal_id=deal_id,
             )
         except IGException as e:
@@ -327,11 +397,20 @@ class Broker:
         deal_status = (confirm.get("dealStatus") or "").upper()
         reason = (confirm.get("reason") or "").upper()
         ok = deal_status in ("ACCEPTED", "OPENED", "CLOSED") or reason == "SUCCESS"
-        fill_price = confirm.get("level")
+        # Descale close fill price back to scan units so downstream
+        # P&L / journal entries use the same unit as plan.stop_price.
+        raw_fill = confirm.get("level")
+        fill_price: float | None = None
+        if raw_fill is not None:
+            fill_price = float(raw_fill)
+            if self._market_data is not None:
+                scale = self._market_data.get_scaling_factor(epic)
+                if scale and scale != 1.0:
+                    fill_price = fill_price / scale
         return CloseResult(
             success=ok,
             deal_id=deal_id,
-            fill_price=float(fill_price) if fill_price is not None else None,
+            fill_price=fill_price,
             closed_at_utc=datetime.utcnow(),
             reason_code=reason if not ok else "SUCCESS",
             raw=confirm,

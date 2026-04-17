@@ -361,7 +361,10 @@ def run(args: argparse.Namespace) -> int:
                     return 0
 
                 end_time = datetime.utcnow() + timedelta(minutes=args.duration_mins)
-                broker = Broker(ig_session)
+                # market_data is passed to Broker so order-placement and
+                # stop-modify calls scale stop_level/stop_distance/limit_level
+                # into IG's quoted units using each epic's scalingFactor.
+                broker = Broker(ig_session, market_data=market_data)
                 exit_config = ExitConfig(
                     trail_activation_gbp=settings.trail_activation_gbp,
                     trail_initial_lock_gbp=settings.trail_initial_lock_gbp,

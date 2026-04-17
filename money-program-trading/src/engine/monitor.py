@@ -566,7 +566,9 @@ class MonitorLoop:
             )
             ok = True
         else:
-            modify = self.broker.modify_stop(state.deal_id, outcome.new_stop_price)
+            modify = self.broker.modify_stop(
+                state.deal_id, outcome.new_stop_price, epic=plan.ig_epic,
+            )
             ok = modify.success
             if not ok:
                 logger.warning(

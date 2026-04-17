@@ -80,9 +80,15 @@ class MockBroker:
     modify_calls: list[dict[str, Any]] = field(default_factory=list)
     close_calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def modify_stop(self, deal_id: str, new_stop_price: float) -> StopModifyResult:
+    def modify_stop(
+        self,
+        deal_id: str,
+        new_stop_price: float,
+        *,
+        epic: str | None = None,
+    ) -> StopModifyResult:
         self.modify_calls.append(
-            {"deal_id": deal_id, "new_stop_price": new_stop_price}
+            {"deal_id": deal_id, "new_stop_price": new_stop_price, "epic": epic}
         )
         return StopModifyResult(
             success=self.modify_should_succeed,

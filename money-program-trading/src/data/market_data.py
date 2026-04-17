@@ -43,6 +43,11 @@ class MarketData:
         self._session = session
         self._epic_cache: dict[str, str] = {}
         self._bar_cache: dict[str, pd.DataFrame] = {}
+        # epic → IG scalingFactor (quoted unit / pricing unit). US CASH
+        # equities typically return 100 — the REST stream quotes in minor
+        # units (e.g., 38350 for $383.50). Cached after first snapshot
+        # fetch so we don't re-hit /markets/{epic} every tick.
+        self._scale_cache: dict[str, float] = {}
         self._cache_dir = CACHE_DIR
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._load_epic_cache()
@@ -77,39 +82,74 @@ class MarketData:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     def _search_market(self, ticker: str, market: str) -> str:
-        """Search IG for a market matching the ticker."""
+        """Search IG for a market matching the ticker.
+
+        Rules (tightened 2026-04-17 after the DEMO shakedown found AMD
+        resolving to a non-AMD instrument via the old "last resort" branch):
+
+        1. Candidate must have a CASH or DFB epic (spread-bet flavour).
+        2. The ticker must appear inside the epic OR inside the
+           instrumentName (case-insensitive). A row like
+           ``AA.D.IAGMERGE.CASH.IP`` / "IAG Merger" will never match "AMD".
+        3. For UK, additionally require LSE/.L markers (preserves the old
+           UK filter).
+        4. If nothing matches, return ``""`` and log a warning. We **do
+           not** fall back to the first CASH row or ``results.iloc[0]`` —
+           silent mis-resolution is the bug that nearly let the engine
+           trade a garbage epic with $3.50 / bid 0 / ask 7.
+        """
+        ticker_upper = ticker.upper()
+
+        def _ticker_match(epic: str, name_upper: str) -> bool:
+            """Whole-token ticker match.
+
+            Epic segments are split on '.' — the ticker must equal one
+            segment exactly. For the instrumentName we split on
+            non-alphanumerics and require an exact segment match. This
+            rejects option epics like ``ON.D.AMDsa15500P6.CASH.IP``
+            where "AMD" is only a substring of ``AMDsa15500P6``.
+            """
+            import re
+
+            epic_segments = [s.upper() for s in epic.split(".")]
+            if ticker_upper in epic_segments:
+                return True
+            name_tokens = [t.upper() for t in re.split(r"[^A-Za-z0-9]+", name_upper) if t]
+            return ticker_upper in name_tokens
+
         try:
             results = self.ig.search_markets(ticker)
             if results is None or results.empty:
                 logger.warning("No IG markets found for %s", ticker)
                 return ""
 
-            # Filter for the right market type
-            # IG returns CFD, spread bet, and other variants
             for _, row in results.iterrows():
                 epic = row.get("epic", "")
-                name = str(row.get("instrumentName", "")).upper()
+                name_upper = str(row.get("instrumentName", "")).upper()
 
-                # Prefer cash/DFB instruments for equities
-                if "CASH" in epic or "DFB" in epic:
-                    if market == "UK" and ("LSE" in name or ".L" in ticker):
-                        logger.info("Resolved %s → %s", ticker, epic)
-                        return epic
-                    elif market == "US":
-                        logger.info("Resolved %s → %s", ticker, epic)
-                        return epic
+                if not ("CASH" in epic or "DFB" in epic):
+                    continue
+                if not _ticker_match(epic, name_upper):
+                    continue
+                if market == "UK" and not ("LSE" in name_upper or ".L" in ticker):
+                    continue
+                # Good enough match — log and return.
+                logger.info("Resolved %s → %s", ticker, epic)
+                return epic
 
-            # Fallback: return first result with CASH in epic
-            for _, row in results.iterrows():
-                epic = row.get("epic", "")
-                if "CASH" in epic:
-                    logger.info("Resolved %s → %s (fallback)", ticker, epic)
-                    return epic
-
-            # Last resort: first result
-            epic = results.iloc[0].get("epic", "")
-            logger.warning("Resolved %s → %s (last resort)", ticker, epic)
-            return epic
+            # Nothing passed the ticker-match filter. Log what we saw so a
+            # post-session reviewer can eyeball the candidates.
+            sample = [
+                (r.get("epic", ""), str(r.get("instrumentName", "")))
+                for _, r in results.head(5).iterrows()
+            ]
+            logger.warning(
+                "No IG epic matched %s/%s after ticker filter. First 5: %r",
+                ticker,
+                market,
+                sample,
+            )
+            return ""
 
         except IGException as e:
             logger.error("IG market search failed for %s: %s", ticker, e)
@@ -300,7 +340,14 @@ class MarketData:
 
         Returns a dict with keys:
             bid, ask, last_traded, market_status, high, low,
-            net_change, pct_change, update_time_utc
+            net_change, pct_change, update_time_utc, scaling_factor
+
+        Prices are **divided by the IG instrument scaling factor** (if
+        present) so downstream code compares bid/ask/last in the same
+        unit as the scan's trigger_low / trigger_high / stop_price. Prior
+        to 2026-04-17 this normalisation was missing and the FDX ×100
+        quote (38350 = $383.50) triggered a false FIRE against a $378
+        trigger.
 
         Returns an empty dict on failure. Callers should treat an empty dict as
         "no data this tick" and write a CandidateSnapshot with nulls rather than
@@ -335,6 +382,16 @@ class MarketData:
             except (TypeError, ValueError):
                 return None
 
+        # Pull and cache scalingFactor from the /markets/{epic} instrument
+        # block. Default to 1.0 when the field is missing or malformed —
+        # UK DFB epics we've tested don't always return it, and 1.0 is
+        # the safe "already in trading units" default.
+        instrument = result.get("instrument") or {}
+        scaling_factor = _f(instrument.get("scalingFactor"))
+        if scaling_factor is None or scaling_factor <= 0:
+            scaling_factor = 1.0
+        self._scale_cache[epic] = scaling_factor
+
         bid = _f(snap.get("bid"))
         ask = _f(snap.get("offer"))
         last_traded = None
@@ -347,17 +404,50 @@ class MarketData:
         if last_traded is None and bid is not None and ask is not None:
             last_traded = (bid + ask) / 2.0
 
+        high = _f(snap.get("high"))
+        low = _f(snap.get("low"))
+
+        # Apply the scaling factor to every price field. net_change /
+        # pct_change are deltas; pct_change is already unitless, and
+        # net_change is in the same quoted units so it must scale too.
+        def _scale(v):
+            return None if v is None else v / scaling_factor
+
         return {
-            "bid": bid,
-            "ask": ask,
-            "last_traded": last_traded,
+            "bid": _scale(bid),
+            "ask": _scale(ask),
+            "last_traded": _scale(last_traded),
             "market_status": snap.get("marketStatus"),
-            "high": _f(snap.get("high")),
-            "low": _f(snap.get("low")),
-            "net_change": _f(snap.get("netChange")),
-            "pct_change": _f(snap.get("percentageChange")),
+            "high": _scale(high),
+            "low": _scale(low),
+            "net_change": _scale(_f(snap.get("netChange"))),
+            "pct_change": _f(snap.get("percentageChange")),  # already %
             "update_time_utc": snap.get("updateTime") or snap.get("updateTimeUTC"),
+            "scaling_factor": scaling_factor,
         }
+
+    # ── Unit conversion helpers ───────────────────────────────
+
+    def get_scaling_factor(self, epic: str) -> float:
+        """Return the cached IG scalingFactor for ``epic``, or 1.0 if we've
+        never fetched a snapshot for it. Callers that need guaranteed
+        freshness should call :meth:`get_market_snapshot` first; this
+        accessor is the read side."""
+        return self._scale_cache.get(epic, 1.0)
+
+    def to_ig_units(self, epic: str, value: float | None) -> float | None:
+        """Convert a price in scan/trading units (e.g., USD dollars) to
+        IG's quoted units (e.g., cents) for ``epic``. Used on the
+        order-placement path so stop_level / limit_level / stop_distance
+        match what IG's REST API expects.
+
+        If no scalingFactor has been observed for ``epic`` yet, returns
+        ``value`` unchanged — the broker path will still log the attempt
+        and the order will either succeed (scale is 1.0) or fail cleanly
+        with a REST error that surfaces as ORDER rejection."""
+        if value is None:
+            return None
+        return float(value) * self.get_scaling_factor(epic)
 
     # ── Caching ───────────────────────────────────────────────
 
