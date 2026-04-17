@@ -40,12 +40,18 @@ from datetime import datetime
 from enum import Enum
 from uuid import uuid4
 
+from typing import TYPE_CHECKING
+
 from ..data.market_data import MarketData
 from ..logging_mod.session_writer import SessionWriter
+
+if TYPE_CHECKING:
+    from .session_clock import SessionClock
 from ..models.candidate_event import (
     CandidateEvent,
     EntryEvaluatedNoEnterPayload,
     FilledPayload,
+    HardCloseExitPayload,
     InvalidationExitPayload,
     OrderPlacedPayload,
     SessionEndedNoTriggerPayload,
@@ -173,6 +179,8 @@ def classify_tick(
     snapshot: dict,
     runtime: CandidateRuntimeState,
     arm_band_pct: float = DEFAULT_ARM_BAND_PCT,
+    session_clock: "SessionClock | None" = None,
+    now: datetime | None = None,
 ) -> TickOutcome:
     """Decide what to do for one candidate given a live snapshot.
 
@@ -221,9 +229,27 @@ def classify_tick(
     if last is None:
         return TickOutcome(decision=Decision.NO_PRICE)
 
+    # Session-clock cutoff: once the entries window closes, suppress FIRE so
+    # we don't open a new position that will immediately be force-closed by
+    # ``evaluate_exit``'s HARD_CLOSE rule. ARM/HOLD/NO_PRICE are unaffected —
+    # observability still matters for post-session journals. A candidate that
+    # would have fired gets a REJECT with code ``R_SESSION_CUTOFF`` so the
+    # journal shows WHY we passed.
+    entries_cutoff_hit = (
+        session_clock is not None
+        and now is not None
+        and session_clock.is_past_entries_cutoff(now)
+    )
+
     if plan.direction == Direction.LONG:
         distance = last - plan.trigger_low  # ≥0 means fired
         if distance >= 0:
+            if entries_cutoff_hit:
+                return TickOutcome(
+                    decision=Decision.REJECT,
+                    rejection_code="R_SESSION_CUTOFF",
+                    distance_pts=distance,
+                )
             return TickOutcome(decision=Decision.FIRE, distance_pts=distance)
         # arm band: how far (in pts) below trigger_low
         band_pts = plan.trigger_low * arm_band_pct
@@ -233,6 +259,12 @@ def classify_tick(
     else:  # SHORT
         distance = plan.trigger_high - last  # ≥0 means fired
         if distance >= 0:
+            if entries_cutoff_hit:
+                return TickOutcome(
+                    decision=Decision.REJECT,
+                    rejection_code="R_SESSION_CUTOFF",
+                    distance_pts=distance,
+                )
             return TickOutcome(decision=Decision.FIRE, distance_pts=distance)
         band_pts = plan.trigger_high * arm_band_pct
         if -distance <= band_pts and not runtime.armed_emitted:
@@ -265,6 +297,10 @@ class MonitorLoop:
     plans: list[CandidatePlan]
     broker: object | None = None
     exit_config: object | None = None  # ExitConfig; lazily imported to avoid cycles
+    # Optional: session-time gates for the intraday-preferred model.
+    # When set, classify_tick suppresses FIRE past entries_cutoff_utc and
+    # evaluate_exit returns EXIT(HARD_CLOSE) past hard_close_utc.
+    session_clock: "SessionClock | None" = None
     tick_interval_seconds: int = 60
     arm_band_pct: float = DEFAULT_ARM_BAND_PCT
     now_fn: Callable[[], datetime] = field(default=datetime.utcnow)
@@ -387,7 +423,14 @@ class MonitorLoop:
         snapshot: dict,
         now: datetime,
     ) -> None:
-        outcome = classify_tick(plan, snapshot, state, self.arm_band_pct)
+        outcome = classify_tick(
+            plan,
+            snapshot,
+            state,
+            self.arm_band_pct,
+            session_clock=self.session_clock,
+            now=now,
+        )
         self._write_snapshot_pre_trigger(plan, state, snapshot, now, outcome)
 
         if outcome.decision == Decision.FIRE:
@@ -539,7 +582,9 @@ class MonitorLoop:
             trail_step_count=state.trail_step_count,
             sessions_held=state.sessions_held,
         )
-        outcome = evaluate_exit(plan, pos, snapshot, now, self.exit_config)
+        outcome = evaluate_exit(
+            plan, pos, snapshot, now, self.exit_config, self.session_clock
+        )
 
         self._write_snapshot_open_position(plan, state, snapshot, now, outcome)
 
@@ -1005,6 +1050,16 @@ class MonitorLoop:
                 sessions_held=state.sessions_held,
                 realised_pnl_gbp=realised_pnl_gbp,
             )
+        elif outcome.reason == ExitReason.HARD_CLOSE:
+            mins_to_end = 0
+            if self.session_clock is not None:
+                mins_to_end = self.session_clock.minutes_to_session_end(now)
+            payload = HardCloseExitPayload(
+                last_price=last_price,
+                fill_price=state.fill_price or 0.0,
+                mins_to_session_end=mins_to_end,
+                realised_pnl_gbp=realised_pnl_gbp,
+            )
         else:
             raise ValueError(f"Unhandled exit reason: {outcome.reason}")
 
@@ -1100,4 +1155,8 @@ def _exit_reason_to_types(reason) -> tuple[EventType, TerminalReason]:
         ),
         ExitReason.TRAIL_EXIT: (EventType.TRAIL_EXIT, TerminalReason.TRAIL_EXIT),
         ExitReason.TIMESTOP: (EventType.TIMESTOP_HIT, TerminalReason.TIMESTOP_HIT),
+        ExitReason.HARD_CLOSE: (
+            EventType.HARD_CLOSE_EXIT,
+            TerminalReason.HARD_CLOSE,
+        ),
     }[reason]

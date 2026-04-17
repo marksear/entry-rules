@@ -85,20 +85,42 @@ class MarketData:
         """Search IG for a market matching the ticker.
 
         Rules (tightened 2026-04-17 after the DEMO shakedown found AMD
-        resolving to a non-AMD instrument via the old "last resort" branch):
+        resolving to a non-AMD instrument via the old "last resort" branch;
+        further widened later the same day when US equities were coming
+        back as ``.DAILY.IP`` — the 24-hour spread-bet flavour — which the
+        original CASH/DFB-only filter wrongly rejected):
 
-        1. Candidate must have a CASH or DFB epic (spread-bet flavour).
-        2. The ticker must appear inside the epic OR inside the
-           instrumentName (case-insensitive). A row like
-           ``AA.D.IAGMERGE.CASH.IP`` / "IAG Merger" will never match "AMD".
+        1. Candidate epic segment must be one of the **accepted spread-bet
+           flavours**: CASH (undated, regular hours), DFB (daily funded
+           bet), or DAILY (24-hour). Dated futures segments (JUN/SEP/DEC/
+           MAR) are rejected — their expiry / rollover behaviour makes
+           them unsuitable for day-trading.
+        2. The ticker must appear **as a whole token** inside the epic
+           OR inside the instrumentName (case-insensitive). A row like
+           ``ON.D.AMDsa15500P6.CASH.IP`` will never match "AMD" because
+           the substring "AMD" sits inside ``AMDsa15500P6`` — only whole
+           segments count.
         3. For UK, additionally require LSE/.L markers (preserves the old
            UK filter).
-        4. If nothing matches, return ``""`` and log a warning. We **do
+        4. **Preference order among valid matches:** CASH > DFB > DAILY.
+           CASH is the cleanest (true undated cash market); DFB has
+           overnight funding; DAILY is the 24-hour flavour and is fine
+           for intraday but slightly wider spread. We walk all results
+           and pick the highest-priority match rather than returning the
+           first hit.
+        5. If nothing matches, return ``""`` and log a warning. We **do
            not** fall back to the first CASH row or ``results.iloc[0]`` —
            silent mis-resolution is the bug that nearly let the engine
            trade a garbage epic with $3.50 / bid 0 / ask 7.
         """
         ticker_upper = ticker.upper()
+
+        # Preference order: lower index = higher priority.
+        _FLAVOUR_ORDER = ("CASH", "DFB", "DAILY")
+        # Segments that immediately disqualify a row even if the ticker
+        # matches (dated futures / options expiry months).
+        _REJECT_SEGMENTS = {"JUN", "SEP", "DEC", "MAR", "JAN", "FEB", "APR",
+                            "MAY", "JUL", "AUG", "OCT", "NOV"}
 
         def _ticker_match(epic: str, name_upper: str) -> bool:
             """Whole-token ticker match.
@@ -117,25 +139,58 @@ class MarketData:
             name_tokens = [t.upper() for t in re.split(r"[^A-Za-z0-9]+", name_upper) if t]
             return ticker_upper in name_tokens
 
+        def _flavour_index(epic: str) -> int:
+            """Return 0/1/2 for CASH/DFB/DAILY, or -1 if none / rejected.
+
+            A row whose epic contains any dated-expiry segment is
+            rejected outright by returning -1.
+            """
+            segments = {s.upper() for s in epic.split(".")}
+            if segments & _REJECT_SEGMENTS:
+                return -1
+            for i, flavour in enumerate(_FLAVOUR_ORDER):
+                if flavour in segments:
+                    return i
+            return -1
+
         try:
             results = self.ig.search_markets(ticker)
             if results is None or results.empty:
                 logger.warning("No IG markets found for %s", ticker)
                 return ""
 
+            # Walk all rows, keep the highest-priority spread-bet flavour
+            # that passes the ticker-match filter. `best_priority == 0`
+            # means we've found a CASH epic and can short-circuit.
+            best_epic = ""
+            best_priority = len(_FLAVOUR_ORDER)  # higher == worse
+
             for _, row in results.iterrows():
-                epic = row.get("epic", "")
+                epic = str(row.get("epic", ""))
                 name_upper = str(row.get("instrumentName", "")).upper()
 
-                if not ("CASH" in epic or "DFB" in epic):
-                    continue
+                priority = _flavour_index(epic)
+                if priority < 0:
+                    continue  # not a spread-bet flavour or dated-expiry
                 if not _ticker_match(epic, name_upper):
                     continue
                 if market == "UK" and not ("LSE" in name_upper or ".L" in ticker):
                     continue
-                # Good enough match — log and return.
-                logger.info("Resolved %s → %s", ticker, epic)
-                return epic
+
+                if priority < best_priority:
+                    best_epic = epic
+                    best_priority = priority
+                    if priority == 0:  # CASH — can't beat it
+                        break
+
+            if best_epic:
+                logger.info(
+                    "Resolved %s → %s (flavour=%s)",
+                    ticker,
+                    best_epic,
+                    _FLAVOUR_ORDER[best_priority],
+                )
+                return best_epic
 
             # Nothing passed the ticker-match filter. Log what we saw so a
             # post-session reviewer can eyeball the candidates.

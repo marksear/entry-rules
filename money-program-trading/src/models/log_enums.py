@@ -72,6 +72,10 @@ class TerminalReason(str, Enum):
     INVALIDATION_EXIT = "INVALIDATION_EXIT"
     INVALIDATED_PRE_TRIGGER = "INVALIDATED_PRE_TRIGGER"
     SESSION_ENDED_NO_TRIGGER = "SESSION_ENDED_NO_TRIGGER"
+    # Intraday-preferred exit: open position carried into the last N minutes of
+    # the session and was force-closed to avoid an overnight hold. Set by
+    # ``evaluate_exit`` when ``SessionClock.hard_close_utc`` is crossed.
+    HARD_CLOSE = "HARD_CLOSE"
 
 
 # --- Grades (matches swing-committee's scorer output) ---
@@ -128,6 +132,8 @@ class EventType(str, Enum):
     TARGET_HIT = "TARGET_HIT"
     TIMESTOP_HIT = "TIMESTOP_HIT"
     TRAIL_EXIT = "TRAIL_EXIT"
+    # Intraday-preferred: force-close triggered by SessionClock, not by price.
+    HARD_CLOSE_EXIT = "HARD_CLOSE_EXIT"
 
     # Environmental
     REGIME_CHANGED = "REGIME_CHANGED"

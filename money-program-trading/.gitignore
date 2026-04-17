@@ -26,3 +26,15 @@ logs/*.log
 # OS
 .DS_Store
 Thumbs.db
+
+# Cache artefacts — rebuilt by tools/build_universe.py and tools/verify_etf_spreadbets.py
+data/cache/universe.json
+data/cache/etf_verification.json
+data/trading.db-wal
+data/.fuse_hidden*
+
+# Cache artefacts — rebuilt by tools
+data/cache/universe.json
+data/cache/etf_verification.json
+data/trading.db-wal
+data/.fuse_hidden*

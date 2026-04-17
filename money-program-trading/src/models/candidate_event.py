@@ -194,6 +194,23 @@ class TrailExitPayload(_PayloadBase):
     realised_pnl_gbp: float
 
 
+class HardCloseExitPayload(_PayloadBase):
+    """Emitted when the SessionClock force-closes an open position before
+    session end.
+
+    Distinct from TIMESTOP_HIT: timestop is a multi-session rule (held ≥ N
+    sessions); hard-close fires within the *same* session as fill, once
+    ``now`` crosses ``hard_close_utc`` (session end minus buffer). Recording
+    it as its own event avoids polluting the timestop metric.
+    """
+
+    kind: Literal["HARD_CLOSE_EXIT"] = "HARD_CLOSE_EXIT"
+    last_price: float
+    fill_price: float
+    mins_to_session_end: int
+    realised_pnl_gbp: float
+
+
 class RegimeChangedPayload(_PayloadBase):
     kind: Literal["REGIME_CHANGED"] = "REGIME_CHANGED"
     old_regime: RegimeState
@@ -243,6 +260,7 @@ EventPayload = Annotated[
         | TargetHitPayload
         | TimestopHitPayload
         | TrailExitPayload
+        | HardCloseExitPayload
         | RegimeChangedPayload
         | RejectedRiskBudgetPayload
         | GateBypassActivePayload

@@ -42,6 +42,7 @@ from enum import Enum
 
 from ..models.common import Direction
 from .monitor import CandidatePlan
+from .session_clock import SessionClock
 
 # ---------------------------------------------------------------------------
 # Config + state dataclasses
@@ -119,6 +120,9 @@ class ExitReason(str, Enum):
     HARD_TARGET = "HARD_TARGET"
     TRAIL_EXIT = "TRAIL_EXIT"
     TIMESTOP = "TIMESTOP"
+    # Intraday-preferred: SessionClock.must_hard_close() flipped True.
+    # Maps to EventType.HARD_CLOSE_EXIT / TerminalReason.HARD_CLOSE.
+    HARD_CLOSE = "HARD_CLOSE"
 
 
 @dataclass
@@ -229,6 +233,7 @@ def evaluate_exit(
     snapshot: dict,
     now: datetime,
     config: ExitConfig,
+    session_clock: SessionClock | None = None,
 ) -> ExitOutcome:
     """Per-tick exit decision for one open position.
 
@@ -240,6 +245,13 @@ def evaluate_exit(
 
     This function is pure: given the same inputs, it returns the same outcome.
     It never reads from / writes to IG or the DB.
+
+    When ``session_clock`` is provided and ``now >= hard_close_utc``, the
+    function short-circuits with ``EXIT(HARD_CLOSE)`` — the intraday-
+    preferred model. We do this *after* confirming the snapshot is usable
+    so we still record ``NO_PRICE`` for ticks where the market's closed or
+    IG returned junk (otherwise we'd book a hard-close with no last price
+    in the payload).
     """
     # --- Snapshot usability ---
     if not snapshot:
@@ -252,6 +264,23 @@ def evaluate_exit(
     last = snapshot.get("last_traded")
     if last is None:
         return ExitOutcome(action=ExitAction.NO_PRICE)
+
+    # --- 0. Session-clock hard close (intraday-preferred) ---
+    # Evaluated before everything else so we always market-exit on time.
+    # Intentionally NOT gated on any P&L / trail state — if the clock says
+    # go, we go.
+    if session_clock is not None and session_clock.must_hard_close(now):
+        pnl = unrealised_pnl_gbp(
+            plan.direction, last, position.fill_price, position.stake_gbp_per_pt
+        )
+        peak = max(position.peak_pnl_gbp, pnl)
+        return ExitOutcome(
+            action=ExitAction.EXIT,
+            reason=ExitReason.HARD_CLOSE,
+            last_price=last,
+            unrealised_pnl_gbp=pnl,
+            peak_pnl_gbp=peak,
+        )
 
     # --- Core computations reused across branches ---
     pnl = unrealised_pnl_gbp(

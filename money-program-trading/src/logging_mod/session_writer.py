@@ -41,7 +41,7 @@ import json
 import logging
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from ..models.candidate_event import CandidateEvent
@@ -51,6 +51,9 @@ from ..models.scan_record import ScanRecord
 from ..models.session_record import LOG_SCHEMA_VERSION, SessionRecord
 from ..models.shortlist_entry import ShortlistEntry
 from .db import Database
+
+if TYPE_CHECKING:
+    from ..data.market_data import MarketData
 
 logger = logging.getLogger(__name__)
 
@@ -214,17 +217,49 @@ class SessionWriter:
     # Scan ingest
     # ------------------------------------------------------------------
 
-    def ingest_scan(self, scan_json_path: Path | str) -> str:
+    def ingest_scan(
+        self,
+        scan_json_path: Path | str,
+        *,
+        market_data: "MarketData | None" = None,
+        anchor_max_drift_pct: float = 0.15,
+    ) -> str:
         """Load a swing-committee scan handoff and persist it.
 
         Inserts rows into ``scans``, ``scan_universe``, and
         ``shortlist_entries`` in a single transaction, then stamps
         ``sessions.scan_id``. Returns the ``scan_id``.
 
+        Price grounding
+        ---------------
+        When ``market_data`` is provided, every shortlist entry is
+        checked against IG's current snapshot via
+        :func:`src.engine.scan_anchor.anchor_shortlist_to_ig`. Entries
+        whose trigger-zone midpoint drifts more than
+        ``anchor_max_drift_pct`` from IG's ``last_traded`` are **dropped
+        before insert** and the rejection is logged. This is the fix
+        for the 2026-04-17 DEMO shakedown where swing-committee's LLM
+        emitted AMD at $278 (IG ~$155) and FDX at $380 (IG $383.50
+        after scaling). If ``market_data`` is ``None``, grounding is
+        skipped — callers doing unit tests or offline replay opt out
+        that way.
+
+        Args:
+            scan_json_path: Path to ``scan_YYYYMMDD.json``.
+            market_data: Optional authenticated ``MarketData``. Required
+                for price grounding; pass ``None`` to skip grounding
+                (unit tests, offline replay).
+            anchor_max_drift_pct: Maximum tolerated drift between scan
+                reference price and IG last_traded (0.15 = 15%).
+
         Raises:
             FileNotFoundError: if the handoff file is missing.
             ValueError: if broker_mode in the scan disagrees with the session.
             pydantic.ValidationError: if the handoff shape is wrong.
+            RuntimeError: if grounding drops every entry and ``gate_bypass``
+                is not set (we refuse to ingest an empty shortlist in
+                normal mode — safer to fail loud than open a session
+                with no candidates).
         """
         if self.session_id is None:
             raise RuntimeError("SessionWriter not opened — use 'with' or call __enter__ first.")
@@ -268,6 +303,35 @@ class SessionWriter:
                 raise ValueError(
                     "gate_bypass=True is only permitted with broker_mode=DEMO. "
                     "Refusing ingest — this is a mechanics-test mode."
+                )
+
+        # Price grounding — reject LLM-hallucinated levels before they
+        # poison the session. Skipped when market_data is None (unit
+        # tests / offline replay).
+        anchor_report = None
+        if market_data is not None and entries:
+            from ..engine.scan_anchor import anchor_shortlist_to_ig
+
+            anchor_report = anchor_shortlist_to_ig(
+                entries,
+                market_data,
+                max_drift_pct=anchor_max_drift_pct,
+            )
+            pre_count = len(entries)
+            entries = anchor_report.accepted
+            logger.info(
+                "Scan price grounding: %s (kept %d/%d)",
+                anchor_report.summary_line(),
+                len(entries),
+                pre_count,
+            )
+            if not entries and not scan.gate_bypass:
+                raise RuntimeError(
+                    "Scan price grounding dropped all shortlist entries. "
+                    "Refusing to open a session with no candidates. "
+                    f"Rejection reasons: {anchor_report.rejections_by_reason()}. "
+                    "Either regenerate the scan, relax --anchor-max-drift, or "
+                    "set gate_bypass=True for a mechanics-test run."
                 )
 
         # Stamp the session_id onto the scan + shortlist rows before insert so

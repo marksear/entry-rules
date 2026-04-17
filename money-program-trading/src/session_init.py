@@ -41,6 +41,7 @@ from .data.market_data import MarketData
 from .engine.broker import Broker
 from .engine.monitor import CandidatePlan, MonitorLoop
 from .engine.resume import fetch_live_positions, rehydrate_open_positions
+from .engine.session_clock import SessionClock
 from .engine.trail_manager import ExitConfig
 from .logging_mod.db import Database
 from .logging_mod.session_writer import SessionWriter
@@ -343,7 +344,12 @@ def run(args: argparse.Namespace) -> int:
                     "Resumed %d position(s) from prior session(s).", len(resumed)
                 )
 
-                scan_id = writer.ingest_scan(scan_path)
+                # Pass market_data so the writer grounds shortlist prices
+                # against IG's current snapshot (scan_anchor.py) — rejects
+                # entries whose trigger-zone midpoint drifts > 15% from
+                # IG's last_traded. This catches LLM-fabricated price
+                # levels before they reach the monitor loop.
+                scan_id = writer.ingest_scan(scan_path, market_data=market_data)
                 logger.info("Scan ingested: scan_id=%s", scan_id)
 
                 # If the scan was curated under gate_bypass, stamp a prominent
@@ -374,6 +380,24 @@ def run(args: argparse.Namespace) -> int:
                     invalidation_window_minutes=settings.invalidation_window_minutes,
                     timestop_sessions=settings.timestop_sessions,
                 )
+                # Build the SessionClock for today's US session. This enforces
+                # the intraday-preferred exit policy:
+                # * no new entries after 19:30 UK (absolute cutoff)
+                # * force-close open positions 10 min before NY close
+                # The clock is optional — passing None reverts to pre-Session-9
+                # behaviour (positions held through the night). We default to
+                # US session here because the current universe is ~170 US
+                # tickers + 15 FTSE + 6 indices; FTSE-heavy sessions can build
+                # their own clock at session start.
+                from datetime import date as _date
+                session_clock = SessionClock.for_us_session(_date.today())
+                logger.info(
+                    "SessionClock (US): session_end=%s, hard_close=%s, entries_cutoff=%s",
+                    session_clock.session_end_utc.isoformat(),
+                    session_clock.hard_close_utc.isoformat(),
+                    session_clock.entries_cutoff_utc.isoformat(),
+                )
+
                 loop = MonitorLoop(
                     writer=writer,
                     market_data=market_data,
@@ -381,6 +405,7 @@ def run(args: argparse.Namespace) -> int:
                     tick_interval_seconds=args.tick_seconds,
                     broker=broker,
                     exit_config=exit_config,
+                    session_clock=session_clock,
                 )
                 for resumed_plan, resumed_state in resumed:
                     loop.seed_resumed_position(resumed_plan, resumed_state)

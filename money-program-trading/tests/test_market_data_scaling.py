@@ -273,3 +273,85 @@ def test_search_market_prefers_exact_segment_match_over_options_row():
     )
     md = _make_market_data(FakeIGService(search_response=results))
     assert md._search_market("AMD", "US") == "UA.D.AMD.CASH.IP"
+
+
+# ---------------------------------------------------------------------------
+# _search_market — DAILY (24-hour) acceptance + dated-futures rejection
+# (Added 2026-04-17 after universe build found AAPL/ABBV/ABT/ACN/ADBE being
+#  rejected because IG returns them as ``.DAILY.IP`` epics, not CASH.)
+# ---------------------------------------------------------------------------
+
+
+def test_search_market_accepts_daily_24hour_epic_for_us_equities():
+    """IG returns US equities as ``.DAILY.IP`` (24-hour spread bet)
+    ahead of any CASH row, and often CASH doesn't exist at all for
+    single-name US stocks on spread-bet accounts. The resolver must
+    accept DAILY when nothing better is available."""
+    results = pd.DataFrame(
+        [
+            {"epic": "UA.D.AAPL.DAILY.IP", "instrumentName": "Apple Inc (24 Hours)"},
+            {"epic": "UA.D.AAPL.JUN.IP", "instrumentName": "Apple Inc (24 Hours)"},
+            {"epic": "UA.D.AAPL.SEP.IP", "instrumentName": "Apple Inc (24 Hours)"},
+        ]
+    )
+    md = _make_market_data(FakeIGService(search_response=results))
+    assert md._search_market("AAPL", "US") == "UA.D.AAPL.DAILY.IP"
+
+
+def test_search_market_rejects_dated_expiry_segments():
+    """``.JUN.IP`` / ``.SEP.IP`` / ``.DEC.IP`` / ``.MAR.IP`` are quarterly
+    futures — rollover behaviour makes them unsuitable for day-trading.
+    The resolver must reject them even if the ticker matches, and return
+    '' when only dated rows are available."""
+    results = pd.DataFrame(
+        [
+            {"epic": "UA.D.AAPL.JUN.IP", "instrumentName": "Apple Inc"},
+            {"epic": "UA.D.AAPL.SEP.IP", "instrumentName": "Apple Inc"},
+            {"epic": "UA.D.AAPL.DEC.IP", "instrumentName": "Apple Inc"},
+            {"epic": "UA.D.AAPL.MAR.IP", "instrumentName": "Apple Inc"},
+        ]
+    )
+    md = _make_market_data(FakeIGService(search_response=results))
+    assert md._search_market("AAPL", "US") == ""
+
+
+def test_search_market_prefers_cash_over_daily_when_both_present():
+    """If IG returns both a CASH row and a DAILY row for the same ticker,
+    CASH wins (cleaner undated cash market, no 24-hour spread penalty)."""
+    results = pd.DataFrame(
+        [
+            {"epic": "UA.D.AAPL.DAILY.IP", "instrumentName": "Apple Inc (24 Hours)"},
+            {"epic": "UA.D.AAPL.CASH.IP", "instrumentName": "Apple Inc"},
+        ]
+    )
+    md = _make_market_data(FakeIGService(search_response=results))
+    assert md._search_market("AAPL", "US") == "UA.D.AAPL.CASH.IP"
+
+
+def test_search_market_prefers_dfb_over_daily():
+    """DFB (daily funded bet, IG's main UK intraday product) beats DAILY
+    (24-hour)."""
+    results = pd.DataFrame(
+        [
+            {"epic": "UA.D.AAPL.DAILY.IP", "instrumentName": "Apple Inc (24 Hours)"},
+            {"epic": "UA.D.AAPL.DFB.IP", "instrumentName": "Apple Inc"},
+        ]
+    )
+    md = _make_market_data(FakeIGService(search_response=results))
+    assert md._search_market("AAPL", "US") == "UA.D.AAPL.DFB.IP"
+
+
+def test_search_market_skips_dated_rows_and_picks_daily():
+    """Real-world shape from the 2026-04-17 universe build: IG returned
+    DAILY + three quarterly rows for AAPL. The resolver must skip the
+    quarterlies and return DAILY."""
+    results = pd.DataFrame(
+        [
+            {"epic": "UA.D.AAPL.JUN.IP", "instrumentName": "Apple Inc (24 Hours)"},
+            {"epic": "UA.D.AAPL.SEP.IP", "instrumentName": "Apple Inc (24 Hours)"},
+            {"epic": "UA.D.AAPL.DEC.IP", "instrumentName": "Apple Inc (24 Hours)"},
+            {"epic": "UA.D.AAPL.DAILY.IP", "instrumentName": "Apple Inc (24 Hours)"},
+        ]
+    )
+    md = _make_market_data(FakeIGService(search_response=results))
+    assert md._search_market("AAPL", "US") == "UA.D.AAPL.DAILY.IP"
