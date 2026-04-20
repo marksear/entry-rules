@@ -475,15 +475,50 @@ class MonitorLoop:
             self._emit_entry_evaluated_no_enter(plan, snapshot, now, "R_NO_STAKE")
             return
 
+        # Compute the grade-scaled £ take-profit limit to attach at IG.
+        # Lazy-import to avoid the monitor↔trail_manager cycle at top level.
+        from .trail_manager import get_hard_target_gbp
+
+        target_gbp = get_hard_target_gbp(plan.grade, self.exit_config)
+        entry_ref = (
+            plan.trigger_high if plan.direction == Direction.LONG else plan.trigger_low
+        )
+        limit_level_scan = self.broker.compute_limit_price_for_target(
+            epic=plan.ig_epic,
+            direction=plan.direction,
+            entry_price=entry_ref,
+            size=plan.planned_stake_gbp_per_pt,
+            target_gbp=target_gbp,
+        )
+        if limit_level_scan is None:
+            # Legacy broker (no MarketData) or zero stake — log and proceed
+            # without a take-profit. The monitor-side trail ladder still
+            # runs; we just lose the broker-enforced safety net.
+            logger.warning(
+                "FIRE for %s: compute_limit_price_for_target returned None "
+                "(grade=%s, target_gbp=%.2f) — opening without limit.",
+                plan.symbol,
+                plan.grade.value if hasattr(plan.grade, "value") else plan.grade,
+                target_gbp,
+            )
+
         result = self.broker.place_open_position(
             epic=plan.ig_epic,
             direction=plan.direction,
             size=plan.planned_stake_gbp_per_pt,
             stop_price=plan.stop_price,
+            limit_level=limit_level_scan,
         )
 
         # Emit ORDER_PLACED regardless of success — "we tried to open" is a fact.
-        self._emit_order_placed(plan, state, result, now)
+        self._emit_order_placed(
+            plan,
+            state,
+            result,
+            now,
+            limit_level_scan=limit_level_scan,
+            target_gbp=target_gbp,
+        )
         state.fired = True
         state.deal_reference = result.deal_reference or None
 
@@ -515,14 +550,24 @@ class MonitorLoop:
         state.sessions_held = 1
 
         initial_risk_gbp = abs(result.fill_price - plan.stop_price) * plan.planned_stake_gbp_per_pt
-        self._emit_filled(plan, state, initial_risk_gbp, now)
+        self._emit_filled(
+            plan,
+            state,
+            initial_risk_gbp,
+            now,
+            limit_level_scan=limit_level_scan,
+            target_gbp=target_gbp,
+        )
         logger.info(
-            "FILLED %s %s @ %.4f (stake %.2f £/pt, stop %.4f, risk %.2f GBP)",
+            "FILLED %s %s @ %.4f (stake %.2f £/pt, stop %.4f, limit %s, "
+            "target £%.2f, risk %.2f GBP)",
             plan.symbol,
             plan.direction.value,
             result.fill_price,
             plan.planned_stake_gbp_per_pt,
             plan.stop_price,
+            f"{limit_level_scan:.4f}" if limit_level_scan is not None else "None",
+            target_gbp,
             initial_risk_gbp,
         )
 
@@ -879,7 +924,15 @@ class MonitorLoop:
         state: CandidateRuntimeState,
         result,
         now: datetime,
+        *,
+        limit_level_scan: float | None = None,
+        target_gbp: float | None = None,
     ) -> None:
+        # Derive the IG-units limit (scan × scalingFactor) for the audit
+        # trail — lets replay tools reconstruct what IG actually saw
+        # without re-running the scaling lookup.
+        limit_level_ig = self._scale_limit_to_ig(plan.ig_epic, limit_level_scan)
+        grade_used = plan.grade.value if hasattr(plan.grade, "value") else str(plan.grade)
         event = CandidateEvent(
             id=str(uuid4()),
             session_id=plan.session_id,
@@ -892,6 +945,10 @@ class MonitorLoop:
                 order_type="MARKET",
                 stake_gbp_per_pt=plan.planned_stake_gbp_per_pt,
                 stop_price=plan.stop_price,
+                limit_level_scan=limit_level_scan,
+                limit_level_ig=limit_level_ig,
+                target_gbp=target_gbp,
+                grade_used=grade_used,
             ),
             broker_mode=plan.broker_mode,
             rule_set_version=plan.rule_set_version,
@@ -904,7 +961,12 @@ class MonitorLoop:
         state: CandidateRuntimeState,
         initial_risk_gbp: float,
         now: datetime,
+        *,
+        limit_level_scan: float | None = None,
+        target_gbp: float | None = None,
     ) -> None:
+        limit_level_ig = self._scale_limit_to_ig(plan.ig_epic, limit_level_scan)
+        grade_used = plan.grade.value if hasattr(plan.grade, "value") else str(plan.grade)
         event = CandidateEvent(
             id=str(uuid4()),
             session_id=plan.session_id,
@@ -919,11 +981,31 @@ class MonitorLoop:
                 stake_gbp_per_pt=state.stake_gbp_per_pt or 0.0,
                 initial_stop_price=state.initial_stop_price or 0.0,
                 initial_risk_gbp=initial_risk_gbp,
+                limit_level_scan=limit_level_scan,
+                limit_level_ig=limit_level_ig,
+                target_gbp=target_gbp,
+                grade_used=grade_used,
             ),
             broker_mode=plan.broker_mode,
             rule_set_version=plan.rule_set_version,
         )
         self.writer.write_event(event)
+
+    def _scale_limit_to_ig(self, epic: str, limit_scan: float | None) -> float | None:
+        """Best-effort conversion of a scan-unit limit to IG quoted units
+        for audit purposes. Returns ``None`` when there's no limit or no
+        MarketData attached — the event simply records ``limit_level_ig=None``
+        and consumers know to recompute from ``limit_level_scan`` if needed.
+        """
+        if limit_scan is None:
+            return None
+        md = getattr(self.broker, "_market_data", None)
+        if md is None:
+            return None
+        try:
+            return md.to_ig_units(epic, limit_scan)
+        except Exception:  # noqa: BLE001 — defensive: audit must never crash fire
+            return None
 
     # ------------------------------------------------------------------
     # Event emitters (trail/exit)

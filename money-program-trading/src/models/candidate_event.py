@@ -90,6 +90,17 @@ class OrderPlacedPayload(_PayloadBase):
     order_type: str
     stake_gbp_per_pt: float
     stop_price: float
+    # Broker-enforced £ take-profit (added 2026-04-21 after the DEMO
+    # TERMINAL-monitor silent-failure on JNJ). Optional so replay of
+    # pre-2026-04-21 events from the DB doesn't fail validation.
+    # - limit_level_scan: the price in scan units we asked IG to close at
+    # - limit_level_ig:   the same price after scalingFactor conversion
+    # - target_gbp:       £ P&L the limit was computed to lock
+    # - grade_used:       the grade whose target drove the £ figure
+    limit_level_scan: float | None = None
+    limit_level_ig: float | None = None
+    target_gbp: float | None = None
+    grade_used: str | None = None
 
 
 class FilledPayload(_PayloadBase):
@@ -100,6 +111,13 @@ class FilledPayload(_PayloadBase):
     stake_gbp_per_pt: float
     initial_stop_price: float
     initial_risk_gbp: float
+    # Mirrors OrderPlacedPayload — carried on the FILLED event so the
+    # journal shows "opened at X, stop at Y, limit at Z for £target"
+    # on every fill, without cross-joining ORDER_PLACED + FILLED.
+    limit_level_scan: float | None = None
+    limit_level_ig: float | None = None
+    target_gbp: float | None = None
+    grade_used: str | None = None
 
 
 class PositionResumedPayload(_PayloadBase):

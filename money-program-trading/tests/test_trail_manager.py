@@ -422,11 +422,15 @@ def test_hard_target_exits_even_when_step_advance_would_otherwise_fire():
 
 
 def test_hard_target_symmetric_short():
+    # ``_short_plan()`` is grade A+ → £62.50 hard-target under the 2026-04-21
+    # grade-scaled ladder (see trail_manager.GRADE_TARGET_GBP). Peak must
+    # reach £62.50 to trip HARD_TARGET on an A+ plan; £50 alone is below
+    # the A+ threshold and keeps the position open.
     now = datetime(2026, 4, 17, 15, 30)
     out = evaluate_exit(
         _short_plan(),
-        _short_position(peak_pnl_gbp=50.0, trail_step_count=5, current_stop_price=70.10),
-        _snap(25.10),  # 50 pts favourable
+        _short_position(peak_pnl_gbp=62.5, trail_step_count=5, current_stop_price=70.10),
+        _snap(25.10),  # favourable past the A+ target
         now,
         CFG,
     )

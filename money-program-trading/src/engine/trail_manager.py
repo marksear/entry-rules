@@ -41,6 +41,7 @@ from datetime import datetime
 from enum import Enum
 
 from ..models.common import Direction
+from ..models.log_enums import CandidateGrade
 from .monitor import CandidatePlan
 from .session_clock import SessionClock
 
@@ -49,12 +50,50 @@ from .session_clock import SessionClock
 # ---------------------------------------------------------------------------
 
 
+# Grade → £ hard-cap target. Scales with risk so every trade caps at ~0.5R.
+# - A+: 1.25% risk → £125 on £10k → £62.50 target (0.50R)
+# - A/B: 1.00% risk → £100 on £10k → £50.00 target (0.50R)
+# - C: bypass/mechanics-test only — sized at B's 0.5% ladder, target matches B.
+# The mapping lives at module scope (not on ExitConfig) so session_init can
+# keep passing the scalar ``trail_hard_target_gbp`` as the default. Callers
+# should route grade-aware lookups through :func:`get_hard_target_gbp`.
+GRADE_TARGET_GBP: dict[str, float] = {
+    "A+": 62.50,
+    "A": 50.00,
+    "B": 50.00,
+    "C": 50.00,
+}
+
+
+def get_hard_target_gbp(
+    grade: CandidateGrade | str | None, config: "ExitConfig"
+) -> float:
+    """Resolve the £ hard-cap target for a plan's grade.
+
+    Falls back to ``config.trail_hard_target_gbp`` (historically a scalar
+    default of £50) when the grade is missing, unknown, or ``None``. This
+    keeps legacy callers that pass the scalar directly working, while the
+    new broker-enforced limit-on-open path consumes the mapping.
+    """
+    if grade is None:
+        return config.trail_hard_target_gbp
+    key = grade.value if isinstance(grade, CandidateGrade) else str(grade)
+    return GRADE_TARGET_GBP.get(key, config.trail_hard_target_gbp)
+
+
 @dataclass(frozen=True)
 class ExitConfig:
     """Thresholds driving the exit hierarchy. All £ GBP.
 
     Defaults match ``src/config/settings.py`` — callers should build this from
     :func:`get_settings` so operators can tune behaviour without code changes.
+
+    ``trail_hard_target_gbp`` is the fallback used by
+    :func:`get_hard_target_gbp` when a plan's grade is missing or unknown.
+    The grade-aware target lives in the module-level
+    :data:`GRADE_TARGET_GBP` map; the trail ladder and the broker-enforced
+    limit-on-open both route through the helper so the per-grade scaling
+    is applied in exactly one place.
     """
 
     trail_activation_gbp: float = 25.0
@@ -308,8 +347,12 @@ def evaluate_exit(
     ):
         return ExitOutcome(action=ExitAction.EXIT, reason=ExitReason.INITIAL_STOP, **base)
 
-    # --- 3. Hard target (peak ≥ £50 → market exit; skips any pending step advance) ---
-    if peak >= config.trail_hard_target_gbp:
+    # --- 3. Hard target — grade-scaled (A+ £62.50; A/B/C £50). Fall back to
+    #     config.trail_hard_target_gbp when the plan's grade isn't in the
+    #     mapping. The broker now also attaches an IG-side limit_level at
+    #     this price so the cap fires even if the monitor misses a tick.
+    hard_target = get_hard_target_gbp(plan.grade, config)
+    if peak >= hard_target:
         return ExitOutcome(action=ExitAction.EXIT, reason=ExitReason.HARD_TARGET, **base)
 
     # --- 4. Trail stop hit (armed and price crossed the current trailed stop) ---

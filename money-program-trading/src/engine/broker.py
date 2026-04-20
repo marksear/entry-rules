@@ -173,6 +173,92 @@ class Broker:
             )
         return 0.10
 
+    def _to_ig_stake(
+        self, epic: str, size: float, *, log_label: str = "order"
+    ) -> float:
+        """Convert a scan-unit ``size`` into the IG-quoted stake actually
+        sent on the REST call. Applies two transforms:
+
+        1. Divide by the per-epic ``scalingFactor`` — IG interprets ``size``
+           in the same minor-unit points as ``level``, so a £7.12/pt scan
+           stake on a ×100 epic lands as £712/$1-move without this step.
+        2. Floor at IG's per-epic ``minDealSize``. When the floor triggers,
+           the effective risk exceeds plan target — log WARNING so the
+           session journal records the divergence.
+
+        Consolidates the logic previously inlined in
+        :meth:`place_open_position` and :meth:`close_position` so the
+        monitor can look up the final stake via
+        :meth:`compute_limit_price_for_target` without duplicating the
+        descale rules. Returns ``size`` unchanged when no MarketData is
+        attached (legacy unit-test path).
+        """
+        if self._market_data is None:
+            return size
+        scale = self._market_data.get_scaling_factor(epic)
+        ig_size = size / scale if scale and scale != 1.0 else size
+        min_deal_size = self._fetch_min_deal_size(epic)
+        if ig_size < min_deal_size:
+            logger.warning(
+                "Broker: %s %s descaled size %.4f < minDealSize %.2f — "
+                "clamping to minimum. Effective risk will exceed plan "
+                "target.",
+                epic,
+                log_label,
+                ig_size,
+                min_deal_size,
+            )
+            ig_size = min_deal_size
+        return ig_size
+
+    def compute_limit_price_for_target(
+        self,
+        *,
+        epic: str,
+        direction: Direction,
+        entry_price: float,
+        size: float,
+        target_gbp: float,
+    ) -> float | None:
+        """Return the scan-unit price at which unrealised P&L equals
+        ``target_gbp`` for a position sized at ``size`` (scan units).
+
+        The returned price is intended to be passed straight back as the
+        ``limit_level`` argument to :meth:`place_open_position`; the
+        existing scaling path (``_to_ig``) converts it to IG's quoted
+        units on the way out. Using the POST-descale, POST-minDealSize
+        clamped stake internally guarantees the limit locks exactly
+        ``target_gbp`` at whatever size IG actually accepts — if clamping
+        bumped the stake up, the limit comes back tighter, which is the
+        correct behaviour.
+
+        Returns ``None`` when:
+        - ``target_gbp`` is non-positive
+        - no MarketData is attached (legacy path — limit cannot be
+          computed because we don't know the scale)
+        - the clamped stake is non-positive
+
+        The caller (monitor) logs the None case and proceeds without a
+        take-profit; the trail-ladder remains the exit path.
+        """
+        if target_gbp is None or target_gbp <= 0:
+            return None
+        if self._market_data is None:
+            return None
+        ig_stake = self._to_ig_stake(epic, size, log_label="limit_calc")
+        if ig_stake <= 0:
+            return None
+        scale = self._market_data.get_scaling_factor(epic) or 1.0
+        # Effective scan-unit stake: IG £/pt × scale gives £ per scan-unit
+        # move (e.g., ig_stake=0.24/pt × 100 = £24 per $1 display-move).
+        effective_scan_stake = ig_stake * scale
+        if effective_scan_stake <= 0:
+            return None
+        delta_scan = target_gbp / effective_scan_stake
+        if direction == Direction.LONG:
+            return entry_price + delta_scan
+        return entry_price - delta_scan
+
     # ------------------------------------------------------------------
     # Open a new spread-bet position at market
     # ------------------------------------------------------------------
@@ -211,28 +297,9 @@ class Broker:
         # as £712 per $1 display-move if we don't divide — notional
         # blows through the account and IG rejects with
         # INSUFFICIENT_FUNDS (DEMO 2026-04-20, ARM/JNJ).
-        ig_size = size
+        ig_size = self._to_ig_stake(epic, size, log_label="open")
         if self._market_data is not None:
             scale = self._market_data.get_scaling_factor(epic)
-            if scale and scale != 1.0:
-                ig_size = size / scale
-
-            # Clamp at IG's per-epic minimum deal size. Below this IG
-            # will refuse the order. When clamping triggers, effective
-            # risk exceeds plan target — log WARNING so the divergence
-            # shows up in the session journal.
-            min_deal_size = self._fetch_min_deal_size(epic)
-            if ig_size < min_deal_size:
-                logger.warning(
-                    "Broker: %s descaled size %.4f < minDealSize %.2f — "
-                    "clamping to minimum. Effective risk will exceed "
-                    "plan target.",
-                    epic,
-                    ig_size,
-                    min_deal_size,
-                )
-                ig_size = min_deal_size
-
             if scale and scale != 1.0:
                 logger.info(
                     "Broker: scaling %s ×%.4g → stop_level=%s "
@@ -428,23 +495,9 @@ class Broker:
         # boundary and IG will reject on the same grounds. In practice
         # ``size`` on close mirrors the (already-clamped) open, so the
         # clamp here is defence-in-depth against future divergence.
-        ig_size = size
+        ig_size = self._to_ig_stake(epic, size, log_label="close")
         if self._market_data is not None:
             scale = self._market_data.get_scaling_factor(epic)
-            if scale and scale != 1.0:
-                ig_size = size / scale
-
-            min_deal_size = self._fetch_min_deal_size(epic)
-            if ig_size < min_deal_size:
-                logger.warning(
-                    "Broker: %s close descaled size %.4f < minDealSize "
-                    "%.2f — clamping to minimum.",
-                    epic,
-                    ig_size,
-                    min_deal_size,
-                )
-                ig_size = min_deal_size
-
             if scale and scale != 1.0:
                 logger.info(
                     "Broker: close %s size %.4g → %.4g (÷%.4g)",
