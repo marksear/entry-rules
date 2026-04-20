@@ -36,6 +36,7 @@ position close, event emission).
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -44,6 +45,47 @@ from ..models.common import Direction
 from ..models.log_enums import CandidateGrade
 from .monitor import CandidatePlan
 from .session_clock import SessionClock
+
+
+# ---------------------------------------------------------------------------
+# S-4 interim price-divergence gate constants (FIX: ADD_DIVERGENCE_GATE_SPEC.md)
+# ---------------------------------------------------------------------------
+# Skip exit evaluation when the monitor's last_traded disagrees with the
+# broker's live deal-price by more than this threshold (bps). 30bps on a
+# $234 share is ~70¢ — generous enough that normal bid/ask spread won't
+# trip it, tight enough that the 2026-04-20 JNJ ~$2 divergence (~93bps)
+# would have been caught. Tunable via ``MP_PRICE_DIVERGENCE_SKIP_BPS``.
+#
+# This is a pure safety backstop pending S-3 Lightstreamer migration
+# (task #24). See PRICE_FEED_DIVERGENCE_INVESTIGATION.md for context.
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+PRICE_DIVERGENCE_SKIP_BPS: float = _float_env(
+    "MP_PRICE_DIVERGENCE_SKIP_BPS", 30.0
+)
+PRICE_DIVERGENCE_SKIP_WARN_AFTER_TICKS: int = _int_env(
+    "MP_PRICE_DIVERGENCE_SKIP_WARN_AFTER_TICKS", 3
+)
 
 # ---------------------------------------------------------------------------
 # Config + state dataclasses

@@ -82,11 +82,21 @@ class TerminalReason(str, Enum):
 
 
 class CandidateGrade(str, Enum):
-    """Committee-assigned grade. Below B is not shortlisted."""
+    """Committee-assigned grade.
+
+    A+/A/B are the production ladder. C is accepted ONLY on DEMO bypass
+    (mechanics-test) runs — real trading policy (per
+    ``feedback_small_account_sizing``) never sizes C, and
+    ``backtest/trade_management.risk_percent_for_grade`` returns 0.0 for it.
+    Having C in the enum lets scan_YYYYMMDD.json validate when the
+    swing-committee UI has enabled bypass and the user has picked a C to
+    shake down the pipeline end-to-end.
+    """
 
     A_PLUS = "A+"
     A = "A"
     B = "B"
+    C = "C"
 
 
 # --- Event taxonomy ---
@@ -138,6 +148,12 @@ class EventType(str, Enum):
     # Environmental
     REGIME_CHANGED = "REGIME_CHANGED"
     REJECTED_RISK_BUDGET = "REJECTED_RISK_BUDGET"
+
+    # S-4 interim price-divergence gate. Monitor refused to evaluate exit
+    # logic this tick because its last_traded disagreed with the broker's
+    # deal price by more than the configured threshold (or no deal price
+    # was available). See ADD_DIVERGENCE_GATE_SPEC.md.
+    PRICE_DIVERGENCE_SKIP = "PRICE_DIVERGENCE_SKIP"
 
     # Session-level — governance / bypass
     GATE_BYPASS_ACTIVE = "GATE_BYPASS_ACTIVE"

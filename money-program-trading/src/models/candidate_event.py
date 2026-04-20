@@ -243,6 +243,30 @@ class RejectedRiskBudgetPayload(_PayloadBase):
     portfolio_heat_pct: float
 
 
+class PriceDivergenceSkipPayload(_PayloadBase):
+    """S-4 interim gate skip event. Emitted when the monitor refused to
+    evaluate exit logic because its cached price disagreed with the
+    broker's live deal price (or no deal price was available).
+
+    ``reason_code`` is one of:
+      - ``DIVERGENCE_OVER_THRESHOLD`` — both prices present but
+        |monitor - deal| / deal * 10000 > threshold_bps
+      - ``NO_DEAL_PRICE`` — broker.get_deal_price returned None
+        (fail-safe: we can't verify the feed, so we don't act on it)
+
+    ``delta_bps`` and ``threshold_bps`` are present for
+    ``DIVERGENCE_OVER_THRESHOLD`` and may be None for ``NO_DEAL_PRICE``.
+    """
+
+    kind: Literal["PRICE_DIVERGENCE_SKIP"] = "PRICE_DIVERGENCE_SKIP"
+    reason: str
+    monitor_price: float | None = None
+    deal_price: float | None = None
+    delta_bps: float | None = None
+    threshold_bps: float | None = None
+    consecutive_skips: int = 0
+
+
 class GateBypassActivePayload(_PayloadBase):
     """One emitted per session at session_init time when the ingested scan
     carries ``gate_bypass=True``. Makes the bypass prominent in the journal so
@@ -281,6 +305,7 @@ EventPayload = Annotated[
         | HardCloseExitPayload
         | RegimeChangedPayload
         | RejectedRiskBudgetPayload
+        | PriceDivergenceSkipPayload
         | GateBypassActivePayload
     ),
     Field(discriminator="kind"),

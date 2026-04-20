@@ -8,6 +8,7 @@ from .candidate_event import (
     InvalidatedPreTriggerPayload,
     InvalidationExitPayload,
     OrderPlacedPayload,
+    PriceDivergenceSkipPayload,
     RegimeChangedPayload,
     RejectedRiskBudgetPayload,
     SessionEndedNoTriggerPayload,
@@ -63,7 +64,8 @@ __all__ = [
     # Event payloads
     "EntryEvaluatedNoEnterPayload", "FilledPayload", "GateFlippedPayload",
     "InvalidatedPreTriggerPayload", "InvalidationExitPayload",
-    "OrderPlacedPayload", "RegimeChangedPayload", "RejectedRiskBudgetPayload",
+    "OrderPlacedPayload", "PriceDivergenceSkipPayload",
+    "RegimeChangedPayload", "RejectedRiskBudgetPayload",
     "SessionEndedNoTriggerPayload", "ShortlistAddedPayload",
     "StopHitPayload", "StopMovedPayload", "TargetHitPayload",
     "TimestopHitPayload", "TrailExitPayload", "TrailModeActivatedPayload",

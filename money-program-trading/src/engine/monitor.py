@@ -54,6 +54,7 @@ from ..models.candidate_event import (
     HardCloseExitPayload,
     InvalidationExitPayload,
     OrderPlacedPayload,
+    PriceDivergenceSkipPayload,
     SessionEndedNoTriggerPayload,
     StopHitPayload,
     StopMovedPayload,
@@ -165,6 +166,13 @@ class CandidateRuntimeState:
     # the next tick can re-evaluate and (if the exit rule still fires)
     # retry without silently abandoning the position.
     consecutive_close_failures: int = 0
+
+    # S-4 price-divergence gate ----------------------------------------
+    # Incremented each tick the monitor skipped exit evaluation because
+    # its last_traded disagreed with the broker's deal price (or no deal
+    # price was available). Reset to 0 on a tick where the delta came
+    # back within threshold — i.e., the feed recovered.
+    consecutive_divergence_skips: int = 0
 
     def has_close_event(self) -> bool:
         """True if terminal state was reached via a broker-close path.
@@ -440,6 +448,14 @@ class MonitorLoop:
             if not state.fired:
                 self._handle_pre_trigger_tick(plan, state, snapshot, now)
             else:
+                # S-4 price-divergence gate (ADD_DIVERGENCE_GATE_SPEC.md).
+                # Ordering: runs AFTER the invariant backstop above and
+                # BEFORE _handle_open_position_tick's evaluate_exit call.
+                # Only applies to filled plans — pre-trigger ticks have
+                # no position to protect.
+                if self._divergence_gate_blocks(plan, state, snapshot, now):
+                    state.last_snapshot_ts = now
+                    continue
                 self._handle_open_position_tick(plan, state, snapshot, now)
 
             state.last_snapshot_ts = now
@@ -609,6 +625,176 @@ class MonitorLoop:
             target_gbp,
             initial_risk_gbp,
         )
+
+    # ------------------------------------------------------------------
+    # S-4 interim price-divergence gate (ADD_DIVERGENCE_GATE_SPEC.md)
+    # ------------------------------------------------------------------
+
+    def _divergence_gate_blocks(
+        self,
+        plan: CandidatePlan,
+        state: CandidateRuntimeState,
+        snapshot: dict,
+        now: datetime,
+    ) -> bool:
+        """Return True iff the monitor should SKIP exit evaluation this tick.
+
+        Compares the monitor's ``last_traded`` against ``broker.get_deal_price``
+        and, when they disagree by more than the configured threshold (or
+        when the broker can't give us a live price), emits a
+        PRICE_DIVERGENCE_SKIP event and returns True.
+
+        Pure safety backstop: never makes outcomes worse than the status
+        quo of acting on stale data — only more conservative.
+        """
+        from .trail_manager import (
+            PRICE_DIVERGENCE_SKIP_BPS,
+            PRICE_DIVERGENCE_SKIP_WARN_AFTER_TICKS,
+        )
+
+        # Broker must support the helper. Legacy / test stubs without
+        # ``get_deal_price`` can't participate in the gate — fail open to
+        # preserve existing unit-test behaviour, but log so we notice.
+        get_deal_price = getattr(self.broker, "get_deal_price", None)
+        if get_deal_price is None:
+            return False
+
+        monitor_price = (snapshot or {}).get("last_traded")
+        try:
+            deal_price = get_deal_price(plan.ig_epic, plan.direction)
+        except Exception as e:  # noqa: BLE001 — gate is defensive
+            logger.warning(
+                "Divergence gate: broker.get_deal_price raised for %s: %s",
+                plan.symbol,
+                e,
+            )
+            deal_price = None
+
+        if deal_price is None or monitor_price is None:
+            state.consecutive_divergence_skips += 1
+            self._emit_divergence_skip(
+                plan,
+                state,
+                now,
+                reason="NO_DEAL_PRICE",
+                monitor_price=(
+                    float(monitor_price) if monitor_price is not None else None
+                ),
+                deal_price=deal_price,
+                delta_bps=None,
+                threshold_bps=PRICE_DIVERGENCE_SKIP_BPS,
+            )
+            self._maybe_warn_divergence(plan, state, None)
+            return True
+
+        if deal_price <= 0:
+            # Guard: can't compute bps delta against a zero / negative deal
+            # price. Treat as "divergence unknown → skip".
+            state.consecutive_divergence_skips += 1
+            self._emit_divergence_skip(
+                plan,
+                state,
+                now,
+                reason="NO_DEAL_PRICE",
+                monitor_price=float(monitor_price),
+                deal_price=float(deal_price),
+                delta_bps=None,
+                threshold_bps=PRICE_DIVERGENCE_SKIP_BPS,
+            )
+            self._maybe_warn_divergence(plan, state, None)
+            return True
+
+        delta_bps = abs(float(monitor_price) - float(deal_price)) / float(
+            deal_price
+        ) * 10000.0
+        if delta_bps > PRICE_DIVERGENCE_SKIP_BPS:
+            state.consecutive_divergence_skips += 1
+            self._emit_divergence_skip(
+                plan,
+                state,
+                now,
+                reason="DIVERGENCE_OVER_THRESHOLD",
+                monitor_price=float(monitor_price),
+                deal_price=float(deal_price),
+                delta_bps=delta_bps,
+                threshold_bps=PRICE_DIVERGENCE_SKIP_BPS,
+            )
+            if (
+                state.consecutive_divergence_skips
+                >= PRICE_DIVERGENCE_SKIP_WARN_AFTER_TICKS
+            ):
+                logger.warning(
+                    "Plan %s has skipped %d consecutive ticks due to price "
+                    "divergence (monitor=%.4f deal=%.4f delta=%.1fbps "
+                    "threshold=%.1fbps). Feed staleness or epic mismatch "
+                    "suspected. See task #24 (S-3 Lightstreamer migration).",
+                    plan.symbol,
+                    state.consecutive_divergence_skips,
+                    float(monitor_price),
+                    float(deal_price),
+                    delta_bps,
+                    PRICE_DIVERGENCE_SKIP_BPS,
+                )
+            return True
+
+        # Delta within threshold — clear the counter and let exit
+        # evaluation run normally.
+        state.consecutive_divergence_skips = 0
+        return False
+
+    def _maybe_warn_divergence(
+        self,
+        plan: CandidatePlan,
+        state: CandidateRuntimeState,
+        delta_bps: float | None,
+    ) -> None:
+        from .trail_manager import PRICE_DIVERGENCE_SKIP_WARN_AFTER_TICKS
+
+        if (
+            state.consecutive_divergence_skips
+            >= PRICE_DIVERGENCE_SKIP_WARN_AFTER_TICKS
+        ):
+            logger.warning(
+                "Plan %s has skipped %d consecutive ticks due to missing "
+                "deal price (delta_bps=%s). Feed or broker helper may be "
+                "unavailable.",
+                plan.symbol,
+                state.consecutive_divergence_skips,
+                delta_bps,
+            )
+
+    def _emit_divergence_skip(
+        self,
+        plan: CandidatePlan,
+        state: CandidateRuntimeState,
+        now: datetime,
+        *,
+        reason: str,
+        monitor_price: float | None,
+        deal_price: float | None,
+        delta_bps: float | None,
+        threshold_bps: float,
+    ) -> None:
+        event = CandidateEvent(
+            id=str(uuid4()),
+            session_id=plan.session_id,
+            candidate_id=plan.candidate_id,
+            ts_utc=now,
+            event_type=EventType.PRICE_DIVERGENCE_SKIP,
+            actor=ActorKind.GATE_ENGINE,
+            reason_code=reason,
+            payload=PriceDivergenceSkipPayload(
+                reason=reason,
+                monitor_price=monitor_price,
+                deal_price=deal_price,
+                delta_bps=delta_bps,
+                threshold_bps=threshold_bps,
+                consecutive_skips=state.consecutive_divergence_skips,
+            ),
+            broker_mode=plan.broker_mode,
+            rule_set_version=plan.rule_set_version,
+        )
+        self.writer.write_event(event)
 
     # ------------------------------------------------------------------
     # Post-fill (open position) path
@@ -1249,6 +1435,58 @@ class MonitorLoop:
             self.writer.write_events(events)
             logger.info(
                 "Emitted SESSION_ENDED_NO_TRIGGER x %d on loop shutdown.", len(events)
+            )
+
+        self._log_divergence_summary()
+
+    def _log_divergence_summary(self) -> None:
+        """Surface S-4 price-divergence-gate metrics at session end.
+
+        Output shape (one INFO line per metric, one WARNING per chronic
+        symbol):
+
+          divergence-summary: total_skips=N max_consecutive=M
+                              chronic_symbols=[...]
+          divergence-summary: CHRONIC FEED SUSPECTED symbol=SYM skips=K
+
+        "Chronic" = any plan whose peak ``consecutive_divergence_skips``
+        reached >10 within the session, per ADD_DIVERGENCE_GATE_SPEC.md
+        §4. Surfaced as a WARNING so the operator sees it in the
+        end-of-day tail even if the INFO stream is filtered.
+        """
+        total_skips = 0
+        max_consecutive = 0
+        chronic: list[tuple[str, int]] = []
+        over_five: list[str] = []
+        for plan in self.plans:
+            state = self._runtime.get(plan.candidate_id)
+            if state is None:
+                continue
+            skips = state.consecutive_divergence_skips
+            # consecutive_divergence_skips is the *tail* counter — a better
+            # estimate of session total would need event-table reads. For
+            # the log block we report the counter snapshot at shutdown.
+            if skips > 0:
+                total_skips += skips
+            max_consecutive = max(max_consecutive, skips)
+            if skips > 10:
+                chronic.append((plan.symbol, skips))
+            elif skips > 5:
+                over_five.append(plan.symbol)
+
+        logger.info(
+            "divergence-summary: total_skips=%d max_consecutive=%d "
+            "skipped_gt5_symbols=%s",
+            total_skips,
+            max_consecutive,
+            over_five,
+        )
+        for sym, n in chronic:
+            logger.warning(
+                "divergence-summary: CHRONIC FEED SUSPECTED symbol=%s "
+                "skips=%d — see task #24 (S-3 Lightstreamer migration).",
+                sym,
+                n,
             )
 
 

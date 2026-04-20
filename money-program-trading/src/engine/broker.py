@@ -260,6 +260,93 @@ class Broker:
         return entry_price - delta_scan
 
     # ------------------------------------------------------------------
+    # S-4 interim price-divergence gate helper
+    # ------------------------------------------------------------------
+
+    def get_deal_price(
+        self, epic: str, direction: Direction
+    ) -> float | None:
+        """Return the price IG's dealing engine would use *right now* to
+        close a position in ``direction`` on ``epic``.
+
+        Side convention: LONG closes at the bid, SHORT closes at the ask.
+
+        Endpoint: falls back to ``fetch_market_by_epic`` (the same REST
+        ``/markets/{epic}`` surface ``MarketData.get_market_snapshot``
+        uses). Known refresh cadence: 8+ minutes in the cache-repeat
+        pathology that root-caused the 2026-04-20 JNJ incident (see
+        ``PRICE_FEED_DIVERGENCE_INVESTIGATION.md``). A live streaming
+        feed (Lightstreamer) is task #24 — until that lands, this gate
+        catches *magnitude* divergence when the monitor's own snapshot
+        happens to be fresher (e.g., a different refresh slot) than the
+        cached deal quote, or vice-versa. It is a cheap upper-bound
+        sanity check, not a price correction.
+
+        Returns the price in scan units (descaled by ``scalingFactor``),
+        symmetric with ``fill_price`` / ``stop_level`` elsewhere.
+        Returns ``None`` if no reliable price is obtainable; callers
+        must treat ``None`` as "divergence unknown → skip exit
+        evaluation" (fail safe).
+        """
+        try:
+            result = self.ig.fetch_market_by_epic(epic)
+        except IGException as e:
+            logger.warning(
+                "get_deal_price: IG fetch_market_by_epic failed for %s: %s",
+                epic,
+                e,
+            )
+            return None
+        except Exception as e:  # noqa: BLE001 — defensive at the broker edge
+            logger.warning(
+                "get_deal_price: unexpected error on %s: %s", epic, e
+            )
+            return None
+
+        if hasattr(result, "model_dump"):
+            result = result.model_dump()
+        if not isinstance(result, dict):
+            return None
+        snap = result.get("snapshot") or {}
+        if not snap:
+            return None
+
+        def _f(v):
+            if v is None or v == "":
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        bid = _f(snap.get("bid"))
+        ask = _f(snap.get("offer"))
+        if direction == Direction.LONG:
+            raw = bid
+        else:
+            raw = ask
+        if raw is None:
+            # Fallback to the other side or a mid if the preferred side is
+            # missing — still better than returning None when one of the
+            # two prints is there.
+            raw = bid if raw is None and bid is not None else ask
+        if raw is None:
+            return None
+
+        scale: float | None = None
+        if self._market_data is not None:
+            scale = self._market_data.get_scaling_factor(epic)
+        if (scale is None or scale <= 0) and result.get("instrument"):
+            raw_sf = (result.get("instrument") or {}).get("scalingFactor")
+            try:
+                scale = float(raw_sf) if raw_sf else None
+            except (TypeError, ValueError):
+                scale = None
+        if scale is None or scale <= 0:
+            scale = 1.0
+        return raw / scale
+
+    # ------------------------------------------------------------------
     # Open a new spread-bet position at market
     # ------------------------------------------------------------------
 
