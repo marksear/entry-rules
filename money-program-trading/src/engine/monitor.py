@@ -159,6 +159,23 @@ class CandidateRuntimeState:
     terminal: bool = False
     terminal_reason: TerminalReason | None = None
 
+    # Close-retry backoff -----------------------------------------------
+    # Incremented when broker.close_position returns success=False in
+    # _handle_exit. Reset to 0 on a successful close. Retained on state so
+    # the next tick can re-evaluate and (if the exit rule still fires)
+    # retry without silently abandoning the position.
+    consecutive_close_failures: int = 0
+
+    def has_close_event(self) -> bool:
+        """True if terminal state was reached via a broker-close path.
+
+        False for pre-trigger invalidations, session-ended-no-trigger, and
+        (critically) for any terminal flip that happened *without* a valid
+        close reason being set — which is the TERMINAL-on-open-position
+        failure mode the invariant backstop guards against.
+        """
+        return self.terminal_reason in _CLOSE_TERMINAL_REASONS
+
 
 @dataclass
 class TickOutcome:
@@ -392,6 +409,28 @@ class MonitorLoop:
         now = now or self.now_fn()
         for plan in self.plans:
             state = self._runtime[plan.candidate_id]
+
+            # Invariant backstop (FIX_MONITOR_TERMINAL_BUG_SPEC.md step 8):
+            # a filled plan flagged terminal without a real close event is
+            # the TERMINAL-on-open-position failure mode. Force terminal
+            # back to False so the plan keeps ticking. Loud ERROR so any
+            # regression in this class is visible rather than silent.
+            if (
+                state.terminal
+                and state.fill_ts_utc is not None
+                and not state.has_close_event()
+            ):
+                logger.error(
+                    "INVARIANT VIOLATION: plan %s is terminal+filled with no "
+                    "close event (terminal_reason=%s). This is the TERMINAL-"
+                    "monitor bug. Forcing state.terminal=False to resume "
+                    "ticking. Investigate logs between fill_ts_utc=%s and now.",
+                    plan.symbol,
+                    state.terminal_reason,
+                    state.fill_ts_utc,
+                )
+                state.terminal = False
+
             if state.terminal:
                 # Already closed — don't poll or write further snapshots.
                 continue
@@ -688,7 +727,16 @@ class MonitorLoop:
         outcome,
         now: datetime,
     ) -> None:
-        """EXIT: close the position at IG, emit the terminal event."""
+        """EXIT: close the position at IG, emit the terminal event.
+
+        Fix Shape C (see FIX_MONITOR_TERMINAL_BUG_SPEC.md): a failed broker
+        close MUST NOT mark the plan terminal. If ``broker.close_position``
+        returns ``success=False``, log loudly, bump the backoff counter,
+        and return without emitting the terminal event — the next tick
+        re-evaluates and (if the rule still fires) retries. This prevents
+        the DEMO Day-1 2026-04-20 silent-failure mode where JNJ was left
+        open at IG while the monitor stopped ticking.
+        """
 
         close_fill_price: float | None = None
         if self.broker is not None and state.deal_id:
@@ -699,14 +747,20 @@ class MonitorLoop:
                 size=state.stake_gbp_per_pt or 0.0,
             )
             if not close.success:
+                state.consecutive_close_failures += 1
                 logger.error(
-                    "Close failed for %s (deal_id=%s): %s. "
-                    "Recording terminal event anyway — operator must reconcile.",
+                    "CLOSE FAILED for %s (deal_id=%s): %s — attempt #%d. "
+                    "Plan remains tickable; next tick will retry. Position "
+                    "may still be live at IG — operator verify.",
                     plan.symbol,
                     state.deal_id,
                     close.reason_code,
+                    state.consecutive_close_failures,
                 )
+                return
             close_fill_price = close.fill_price
+
+        state.consecutive_close_failures = 0
         realised_pnl = self._realised_pnl_gbp(plan, state, close_fill_price, outcome)
 
         event_type, terminal_reason = _exit_reason_to_types(outcome.reason)
@@ -1214,6 +1268,17 @@ def _invalidation_window_active(
     if state.fill_ts_utc is None:
         return False
     return (now - state.fill_ts_utc).total_seconds() / 60.0 < window_minutes
+
+
+_CLOSE_TERMINAL_REASONS: frozenset[TerminalReason] = frozenset({
+    TerminalReason.STOPPED_OUT,
+    TerminalReason.TARGET_HIT,
+    TerminalReason.HARD_TARGET_HIT,
+    TerminalReason.TIMESTOP_HIT,
+    TerminalReason.TRAIL_EXIT,
+    TerminalReason.INVALIDATION_EXIT,
+    TerminalReason.HARD_CLOSE,
+})
 
 
 def _exit_reason_to_types(reason) -> tuple[EventType, TerminalReason]:
