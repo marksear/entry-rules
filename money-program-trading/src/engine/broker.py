@@ -141,6 +141,38 @@ class Broker:
             return value
         return self._market_data.to_ig_units(epic, value)
 
+    def _fetch_min_deal_size(self, epic: str) -> float:
+        """Return IG's per-epic ``dealingRules.minDealSize.value`` in £/pt.
+
+        Falls back to ``0.10`` on any fetch or parse failure. Used by
+        :meth:`place_open_position` to clamp the descaled ``size`` so IG
+        doesn't reject the order with a sub-minimum stake. An equivalent
+        lives in legacy ``executor.py`` — kept independent here because
+        the broker owns its own REST surface and executor.py isn't on
+        the active path.
+        """
+        try:
+            result = self.ig.fetch_market_by_epic(epic)
+            if hasattr(result, "model_dump"):
+                result = result.model_dump()
+            rules = (result or {}).get("dealingRules") or {}
+            min_size = (rules.get("minDealSize") or {}).get("value")
+            if min_size is not None:
+                return float(min_size)
+            logger.warning(
+                "Broker: fetch_market_by_epic for %s returned no "
+                "dealingRules.minDealSize — using 0.10 fallback.",
+                epic,
+            )
+        except Exception as e:  # noqa: BLE001 — defensive at the broker edge
+            logger.warning(
+                "Broker: fetch_market_by_epic failed for %s: %s — "
+                "using 0.10 minDealSize fallback.",
+                epic,
+                e,
+            )
+        return 0.10
+
     # ------------------------------------------------------------------
     # Open a new spread-bet position at market
     # ------------------------------------------------------------------
@@ -172,17 +204,46 @@ class Broker:
         ig_stop_level = self._to_ig(epic, stop_price)
         ig_stop_distance = self._to_ig(epic, stop_distance)
         ig_limit_level = self._to_ig(epic, limit_level)
+
+        # Descale ``size`` symmetrically with the price levels above.
+        # IG interprets ``size`` in the same minor-unit points as
+        # ``level``, so a scan stake of £7.12/pt on a ×100 epic lands
+        # as £712 per $1 display-move if we don't divide — notional
+        # blows through the account and IG rejects with
+        # INSUFFICIENT_FUNDS (DEMO 2026-04-20, ARM/JNJ).
+        ig_size = size
         if self._market_data is not None:
             scale = self._market_data.get_scaling_factor(epic)
-            if scale != 1.0:
+            if scale and scale != 1.0:
+                ig_size = size / scale
+
+            # Clamp at IG's per-epic minimum deal size. Below this IG
+            # will refuse the order. When clamping triggers, effective
+            # risk exceeds plan target — log WARNING so the divergence
+            # shows up in the session journal.
+            min_deal_size = self._fetch_min_deal_size(epic)
+            if ig_size < min_deal_size:
+                logger.warning(
+                    "Broker: %s descaled size %.4f < minDealSize %.2f — "
+                    "clamping to minimum. Effective risk will exceed "
+                    "plan target.",
+                    epic,
+                    ig_size,
+                    min_deal_size,
+                )
+                ig_size = min_deal_size
+
+            if scale and scale != 1.0:
                 logger.info(
-                    "Broker: scaling %s levels ×%.4g → stop_level=%s "
-                    "stop_distance=%s limit_level=%s",
+                    "Broker: scaling %s ×%.4g → stop_level=%s "
+                    "stop_distance=%s limit_level=%s; size %.4g → %.4g",
                     epic,
                     scale,
                     ig_stop_level,
                     ig_stop_distance,
                     ig_limit_level,
+                    size,
+                    ig_size,
                 )
 
         kwargs = dict(
@@ -192,7 +253,7 @@ class Broker:
             expiry=expiry,
             force_open=True,
             order_type="MARKET",
-            size=size,
+            size=ig_size,
             guaranteed_stop=False,
             trailing_stop=False,
             level=None,
@@ -362,6 +423,37 @@ class Broker:
         ``direction`` is the *original* trade direction — we flip it here so
         a LONG gets a SELL to close.
         """
+        # Descale ``size`` and clamp at minDealSize for symmetry with
+        # place_open_position — the close crosses the same REST
+        # boundary and IG will reject on the same grounds. In practice
+        # ``size`` on close mirrors the (already-clamped) open, so the
+        # clamp here is defence-in-depth against future divergence.
+        ig_size = size
+        if self._market_data is not None:
+            scale = self._market_data.get_scaling_factor(epic)
+            if scale and scale != 1.0:
+                ig_size = size / scale
+
+            min_deal_size = self._fetch_min_deal_size(epic)
+            if ig_size < min_deal_size:
+                logger.warning(
+                    "Broker: %s close descaled size %.4f < minDealSize "
+                    "%.2f — clamping to minimum.",
+                    epic,
+                    ig_size,
+                    min_deal_size,
+                )
+                ig_size = min_deal_size
+
+            if scale and scale != 1.0:
+                logger.info(
+                    "Broker: close %s size %.4g → %.4g (÷%.4g)",
+                    epic,
+                    size,
+                    ig_size,
+                    scale,
+                )
+
         try:
             resp = self.ig.close_open_position(
                 deal_id=deal_id,
@@ -371,7 +463,7 @@ class Broker:
                 level=None,
                 order_type="MARKET",
                 quote_id=None,
-                size=size,
+                size=ig_size,
                 time_in_force="EXECUTE_AND_ELIMINATE",
             )
         except IGException as e:
