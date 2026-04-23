@@ -6,6 +6,18 @@ Handles:
 - Intraday 5-min bars (for opening range, projected volume)
 - Market search / epic resolution
 - Local caching to stay within IG's 10k/week data allowance
+
+**S-3 Lightstreamer migration (2026-04-23, Phase 1):** real-time price
+reads (``get_market_snapshot``, ``get_current_price``, ``get_spread_pct``)
+are delegated to a ``PriceFeed`` instance injected via the constructor.
+``RestPriceFeed`` — the default — is behaviour-identical to the inline
+REST code that used to live here. ``LightstreamerPriceFeed`` lands in
+Phase 2. See ``docs/specs/S3_LIGHTSTREAMER_SPEC.md``.
+
+The scaling heuristic (``_looks_like_equity_spreadbet`` /
+``_looks_like_minor_units``) moved to ``src/data/scaling.py`` as part of
+the same refactor; the legacy names are re-exported here for any
+downstream import.
 """
 
 from __future__ import annotations
@@ -21,6 +33,9 @@ from trading_ig import IGService
 from trading_ig.rest import IGException
 
 from ..auth.ig_auth import IGSession
+from .price_feed import PriceFeed, RestPriceFeed, Tick
+# Re-export scaling helpers for any historical import paths.
+from .scaling import _looks_like_equity_spreadbet, _looks_like_minor_units  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +54,19 @@ class MarketData:
     - ProRealTime handles the bulk scanning (no Python cost there)
     """
 
-    def __init__(self, session: IGSession):
+    # Class-level sentinel so instances constructed via ``__new__`` (e.g.
+    # the unit-test helper at ``tests/test_market_data_scaling.py`` that
+    # skips ``__init__`` to avoid touching the parquet cache directory)
+    # still see a falsy default. ``get_market_snapshot`` lazily
+    # initialises a ``RestPriceFeed`` from ``self._session`` when this is
+    # ``None`` — preserves today's test ergonomics.
+    _price_feed: PriceFeed | None = None
+
+    def __init__(
+        self,
+        session: IGSession,
+        price_feed: PriceFeed | None = None,
+    ):
         self._session = session
         self._epic_cache: dict[str, str] = {}
         self._bar_cache: dict[str, pd.DataFrame] = {}
@@ -47,7 +74,15 @@ class MarketData:
         # equities typically return 100 — the REST stream quotes in minor
         # units (e.g., 38350 for $383.50). Cached after first snapshot
         # fetch so we don't re-hit /markets/{epic} every tick.
+        #
+        # As of Phase 1 of the S-3 migration, the authoritative cache
+        # lives on ``self._price_feed._scale_cache``; this local
+        # ``_scale_cache`` is kept as a compatibility mirror so any
+        # external code that previously inspected ``MarketData._scale_cache``
+        # (tests do this — see ``tests/test_market_data_scaling.py``) still
+        # sees the same data.
         self._scale_cache: dict[str, float] = {}
+        self._price_feed: PriceFeed = price_feed or RestPriceFeed(session)
         self._cache_dir = CACHE_DIR
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._load_epic_cache()
@@ -382,7 +417,6 @@ class MarketData:
             return (ask - bid) / bid
         return None
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     def get_market_snapshot(self, epic: str) -> dict:
         """
         Fetch a full real-time market snapshot from IG's /markets/{epic} endpoint.
@@ -399,87 +433,29 @@ class MarketData:
 
         Prices are **divided by the IG instrument scaling factor** (if
         present) so downstream code compares bid/ask/last in the same
-        unit as the scan's trigger_low / trigger_high / stop_price. Prior
-        to 2026-04-17 this normalisation was missing and the FDX ×100
-        quote (38350 = $383.50) triggered a false FIRE against a $378
-        trigger.
+        unit as the scan's trigger_low / trigger_high / stop_price.
 
         Returns an empty dict on failure. Callers should treat an empty dict as
         "no data this tick" and write a CandidateSnapshot with nulls rather than
-        retrying — the retry is already handled here.
+        retrying — the retry is already handled inside the feed.
+
+        **S-3 Phase 1 refactor note:** this method is now a thin wrapper over
+        ``self._price_feed.latest(epic)``. All the scaling-factor resolution,
+        bid/ask parsing, and ``@retry`` behaviour that used to live inline
+        has moved into ``src/data/price_feed.py``'s ``RestPriceFeed``. The
+        public return shape is unchanged.
         """
-        try:
-            result = self.ig.fetch_market_by_epic(epic)
-        except IGException as e:
-            logger.error("IG fetch_market_by_epic failed for %s: %s", epic, e)
-            raise
-        except Exception as e:
-            logger.error("Market snapshot failed for %s: %s", epic, e)
-            return {}
-
-        # trading_ig returns either a dict (JSON) or an object; normalise.
-        if hasattr(result, "model_dump"):
-            result = result.model_dump()
-        if not isinstance(result, dict):
-            logger.warning("Unexpected snapshot shape for %s: %r", epic, type(result))
-            return {}
-
-        snap = result.get("snapshot") or {}
-        if not snap:
-            return {}
-
-        def _f(v):
-            """Coerce to float if possible, else None."""
-            if v is None or v == "":
-                return None
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                return None
-
-        # Pull and cache scalingFactor from the /markets/{epic} instrument
-        # block. Default to 1.0 when the field is missing or malformed —
-        # UK DFB epics we've tested don't always return it, and 1.0 is
-        # the safe "already in trading units" default.
-        instrument = result.get("instrument") or {}
-        scaling_factor = _f(instrument.get("scalingFactor"))
-        if scaling_factor is None or scaling_factor <= 0:
-            scaling_factor = 1.0
-        self._scale_cache[epic] = scaling_factor
-
-        bid = _f(snap.get("bid"))
-        ask = _f(snap.get("offer"))
-        last_traded = None
-        # Some IG instruments expose lastTraded; others only bid/offer. Mid fallback
-        # is computed client-side so downstream code always has a usable price.
-        for key in ("lastTraded", "lastTradedPrice"):
-            if key in snap:
-                last_traded = _f(snap.get(key))
-                break
-        if last_traded is None and bid is not None and ask is not None:
-            last_traded = (bid + ask) / 2.0
-
-        high = _f(snap.get("high"))
-        low = _f(snap.get("low"))
-
-        # Apply the scaling factor to every price field. net_change /
-        # pct_change are deltas; pct_change is already unitless, and
-        # net_change is in the same quoted units so it must scale too.
-        def _scale(v):
-            return None if v is None else v / scaling_factor
-
-        return {
-            "bid": _scale(bid),
-            "ask": _scale(ask),
-            "last_traded": _scale(last_traded),
-            "market_status": snap.get("marketStatus"),
-            "high": _scale(high),
-            "low": _scale(low),
-            "net_change": _scale(_f(snap.get("netChange"))),
-            "pct_change": _f(snap.get("percentageChange")),  # already %
-            "update_time_utc": snap.get("updateTime") or snap.get("updateTimeUTC"),
-            "scaling_factor": scaling_factor,
-        }
+        if self._price_feed is None:
+            # __new__-constructed (test-only) instance — lazy-init the
+            # default REST feed from the session we already have.
+            self._price_feed = RestPriceFeed(self._session)
+        tick: Tick = self._price_feed.latest(epic)
+        # Mirror the feed's scaling cache into our local one so callers that
+        # read ``self._scale_cache`` directly (or patch it in tests) keep
+        # seeing the same values.
+        if not tick.is_empty():
+            self._scale_cache[epic] = tick.scaling_factor
+        return tick.as_snapshot_dict()
 
     # ── Unit conversion helpers ───────────────────────────────
 
@@ -487,8 +463,18 @@ class MarketData:
         """Return the cached IG scalingFactor for ``epic``, or 1.0 if we've
         never fetched a snapshot for it. Callers that need guaranteed
         freshness should call :meth:`get_market_snapshot` first; this
-        accessor is the read side."""
-        return self._scale_cache.get(epic, 1.0)
+        accessor is the read side.
+
+        Checks the local ``_scale_cache`` first (preserves test patches
+        and backward compat) and falls through to the feed's cache — Phase 1
+        of the S-3 migration populates both, so either will have the value.
+        """
+        local = self._scale_cache.get(epic)
+        if local is not None:
+            return local
+        if self._price_feed is None:
+            return 1.0
+        return self._price_feed.get_scaling_factor(epic)
 
     def to_ig_units(self, epic: str, value: float | None) -> float | None:
         """Convert a price in scan/trading units (e.g., USD dollars) to
