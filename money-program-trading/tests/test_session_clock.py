@@ -216,7 +216,14 @@ def test_minutes_to_session_end():
 
 def test_classify_tick_fires_normally_before_entries_cutoff():
     plan = _make_plan()
-    state = CandidateRuntimeState()
+    # Pre-seed runtime state to model a non-gap day — the candidate's
+    # session opened BELOW the trigger zone, so Rule 9 BGU is not
+    # engaged and the test can exercise the session-cutoff path alone.
+    state = CandidateRuntimeState(
+        session_open_price=95.0,
+        session_open_ts_utc=datetime(2026, 4, 17, 13, 30, tzinfo=timezone.utc),
+        gap_up_detected=False,
+    )
     clock = SessionClock.for_us_session(date(2026, 4, 17))
     now = datetime(2026, 4, 17, 17, 0, tzinfo=timezone.utc)  # well before cutoff
 
@@ -228,7 +235,13 @@ def test_classify_tick_fires_normally_before_entries_cutoff():
 
 def test_classify_tick_rejects_with_session_cutoff_code_after_cutoff():
     plan = _make_plan()
-    state = CandidateRuntimeState()
+    # Non-gap day (see sibling test) so the session-cutoff rejection is
+    # the thing under test, not Rule 9 BGU.
+    state = CandidateRuntimeState(
+        session_open_price=95.0,
+        session_open_ts_utc=datetime(2026, 4, 17, 13, 30, tzinfo=timezone.utc),
+        gap_up_detected=False,
+    )
     clock = SessionClock.for_us_session(date(2026, 4, 17))
     now = datetime(2026, 4, 17, 18, 31, tzinfo=timezone.utc)  # past 18:30 cutoff
 

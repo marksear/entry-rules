@@ -192,6 +192,18 @@ class CandidateRuntimeState:
     # reset alongside stale_since_utc on recovery.
     degraded_emitted: bool = False
 
+    # ── Masterclass Rule 9 BGU Protocol (Raschke / Morales / Gil) ─
+    # See docs/specs/RULE_9_BGU_SPEC.md. When a LONG candidate's first
+    # observed tick is already at/above trigger_low, we flag the day as
+    # a gap-up and enter the opening-range window.
+    session_open_price: float | None = None
+    session_open_ts_utc: datetime | None = None
+    gap_up_detected: bool = False
+    # Running high/low of last_traded across ticks INSIDE the OR window.
+    # Frozen once the window elapses (see classify_tick).
+    opening_range_high: float | None = None
+    opening_range_low: float | None = None
+
     def has_close_event(self) -> bool:
         """True if terminal state was reached via a broker-close path.
 
@@ -224,6 +236,7 @@ def classify_tick(
     arm_band_pct: float = DEFAULT_ARM_BAND_PCT,
     session_clock: "SessionClock | None" = None,
     now: datetime | None = None,
+    bgu_opening_range_minutes: int = 15,
 ) -> TickOutcome:
     """Decide what to do for one candidate given a live snapshot.
 
@@ -231,9 +244,12 @@ def classify_tick(
         plan: The candidate's immutable plan.
         snapshot: The dict returned by ``MarketData.get_market_snapshot``.
             Keys used: ``last_traded``, ``bid``, ``ask``, ``market_status``.
-        runtime: Mutable per-candidate runtime state (for once-only events).
+        runtime: Mutable per-candidate runtime state (for once-only events
+            and the Rule 9 BGU state machine).
         arm_band_pct: Fraction of trigger distance at which we consider the
             candidate "armed". Default 0.5%.
+        bgu_opening_range_minutes: Minutes after a gap-up open during which
+            no LONG entry may fire (Masterclass Rule 9A). Default 15.
 
     Returns:
         TickOutcome with a Decision + optional rejection_code + distance.
@@ -241,22 +257,36 @@ def classify_tick(
     The rule in words
     -----------------
     - If no usable price / market not tradeable: ``NO_PRICE``.
-    - Long & last_price >= trigger_low: ``FIRE``.
+    - Long & last_price >= trigger_low: normally ``FIRE``, subject to the BGU
+      gate below.
     - Short & last_price <= trigger_high: ``FIRE``.
     - Price within ``arm_band_pct`` of trigger on the favourable side: ``ARM``
       (if not already emitted).
     - Otherwise: ``HOLD`` (we're outside the arm band — write snapshot only).
 
-    REJECT is a slot reserved for a future gate engine — this module never
-    returns it today. It exists here so callers can be stable when that lands.
+    Masterclass Rule 9 BGU gate (LONG only, this PR)
+    ------------------------------------------------
+    When a LONG candidate's FIRST tick in the session is already at or above
+    ``plan.trigger_low``, the stock has gapped into/above the pivot — classify
+    as a Buyable Gap Up (Raschke / Morales / Gil). Two rejections follow:
+
+    - ``R20`` for the first ``bgu_opening_range_minutes`` — opening range
+      forms (high/low tracked tick-by-tick), no entry may fire.
+    - ``R21`` after the window, as long as ``last_traded <= opening_range_high``
+      — the price has not yet confirmed a continuation breakout. Fires only on
+      a strict break above the OR high (Rule 9A).
+
+    A LONG candidate that was NOT flagged as gap-up (i.e. first tick was below
+    trigger_low) takes the existing pre-BGU path unchanged. See
+    ``docs/specs/RULE_9_BGU_SPEC.md`` for full rationale and the TMUS
+    2026-04-24 regression motivation.
 
     Gate bypass
     -----------
-    When the landed gate engine runs, it must honour ``plan.gate_bypass``: if
-    True, it should still compute gate masks for observability (so the journal
-    shows what would have been rejected), but it must NOT return REJECT — the
-    user curated this shortlist themselves in a mechanics-test scan. Exits and
-    sizing are NOT affected by bypass.
+    ``plan.gate_bypass`` lets C-grade signals through the grade ladder for
+    DEMO mechanics tests. It does NOT exempt any Masterclass rule, including
+    Rule 9. Bypass mode still hits R20/R21 the same way a production signal
+    would. See ``feedback_bypass_semantics``.
     """
     if not snapshot:
         return TickOutcome(decision=Decision.NO_PRICE)
@@ -271,6 +301,34 @@ def classify_tick(
     last = snapshot.get("last_traded")
     if last is None:
         return TickOutcome(decision=Decision.NO_PRICE)
+
+    # ── BGU state machine (Masterclass Rule 9A) ─────────────────────
+    # On the first usable tick of the session for this candidate, record
+    # the open price and — for LONGs only — detect whether the stock has
+    # gapped into or above the entry zone. If so, the 15-min opening-
+    # range window opens; otherwise classify_tick proceeds on the pre-
+    # BGU path unchanged.
+    if runtime.session_open_price is None:
+        runtime.session_open_price = last
+        runtime.session_open_ts_utc = now
+        if plan.direction == Direction.LONG and last >= plan.trigger_low:
+            runtime.gap_up_detected = True
+            runtime.opening_range_high = last
+            runtime.opening_range_low = last
+
+    # Track OR high/low while we're inside the window. Freezes after.
+    or_elapsed_seconds: float | None = None
+    if (
+        runtime.gap_up_detected
+        and runtime.session_open_ts_utc is not None
+        and now is not None
+    ):
+        or_elapsed_seconds = (now - runtime.session_open_ts_utc).total_seconds()
+        if or_elapsed_seconds < bgu_opening_range_minutes * 60:
+            if runtime.opening_range_high is None or last > runtime.opening_range_high:
+                runtime.opening_range_high = last
+            if runtime.opening_range_low is None or last < runtime.opening_range_low:
+                runtime.opening_range_low = last
 
     # Session-clock cutoff: once the entries window closes, suppress FIRE so
     # we don't open a new position that will immediately be force-closed by
@@ -287,6 +345,23 @@ def classify_tick(
     if plan.direction == Direction.LONG:
         distance = last - plan.trigger_low  # ≥0 means fired
         if distance >= 0:
+            # ── Rule 9A BGU gate (LONG gap-up days only) ─────────
+            # Inside the 15-min window: no entry, return R20.
+            # After the window: require strict break above OR high.
+            if runtime.gap_up_detected and or_elapsed_seconds is not None:
+                if or_elapsed_seconds < bgu_opening_range_minutes * 60:
+                    return TickOutcome(
+                        decision=Decision.REJECT,
+                        rejection_code="R20",
+                        distance_pts=distance,
+                    )
+                or_high = runtime.opening_range_high
+                if or_high is not None and last <= or_high:
+                    return TickOutcome(
+                        decision=Decision.REJECT,
+                        rejection_code="R21",
+                        distance_pts=distance,
+                    )
             if entries_cutoff_hit:
                 return TickOutcome(
                     decision=Decision.REJECT,
@@ -352,6 +427,10 @@ class MonitorLoop:
     # and emits POSITION_CLOSED_DEGRADED_FEED. Matches the default in
     # Settings.price_feed_degraded_seconds.
     price_feed_degraded_seconds: float = 60.0
+    # Masterclass Rule 9 BGU protocol opening-range window (minutes).
+    # See docs/specs/RULE_9_BGU_SPEC.md and
+    # Settings.bgu_opening_range_minutes. Default 15 matches the spec.
+    bgu_opening_range_minutes: int = 15
     now_fn: Callable[[], datetime] = field(default=utc_now)
 
     _runtime: dict[str, CandidateRuntimeState] = field(default_factory=dict, init=False)
@@ -750,6 +829,7 @@ class MonitorLoop:
             self.arm_band_pct,
             session_clock=self.session_clock,
             now=now,
+            bgu_opening_range_minutes=self.bgu_opening_range_minutes,
         )
         self._write_snapshot_pre_trigger(plan, state, snapshot, now, outcome)
 

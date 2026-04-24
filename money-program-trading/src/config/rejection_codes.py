@@ -34,6 +34,11 @@ class RejectCode(str, Enum):
     R18 = "R18"  # Climax top conditions not met
     R19 = "R19"  # Early-stage gap down — possible shakeout
 
+    # Rule 9 BGU Protocol (Masterclass §3.3).
+    # Docs/specs/RULE_9_BGU_SPEC.md. Raschke / Morales / Gil.
+    R20 = "R20"  # BGU: opening range not yet formed (first 15 min)
+    R21 = "R21"  # BGU: price has not broken above opening-range high
+
     @property
     def description(self) -> str:
         return _DESCRIPTIONS[self]
@@ -64,6 +69,8 @@ _DESCRIPTIONS: dict[RejectCode, str] = {
     RejectCode.R17: "Emergency cover — 15% adverse move",
     RejectCode.R18: "Climax top conditions not met",
     RejectCode.R19: "Early-stage gap down — possible shakeout",
+    RejectCode.R20: "BGU: opening range not yet formed (first 15 min after gap-up open)",
+    RejectCode.R21: "BGU: price has not broken above opening-range high",
 }
 
 _APPLIES_TO: dict[RejectCode, str] = {
@@ -86,4 +93,6 @@ _APPLIES_TO: dict[RejectCode, str] = {
     RejectCode.R17: "SHORT",
     RejectCode.R18: "SHORT",
     RejectCode.R19: "SHORT",
+    RejectCode.R20: "LONG",
+    RejectCode.R21: "LONG",
 }

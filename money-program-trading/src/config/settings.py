@@ -134,6 +134,23 @@ class Settings(BaseSettings):
     entry_window_end: str = Field(default="11:00", description="EST, 24h format")
     entry_check_interval: int = Field(default=60, description="Seconds between checks")
 
+    # ── Rule 9 BGU Protocol (Masterclass §3.3) ────────────────
+    # See docs/specs/RULE_9_BGU_SPEC.md. When a LONG candidate's first
+    # observed tick is already at or above the scan's trigger_low, the
+    # stock has gapped into/above the pivot — classify as a Buyable Gap
+    # Up. For the first N minutes we track the opening range (high/low
+    # of last_traded); no FIRE decision may pass classify_tick during
+    # that window. After the window, FIRE is gated on a strict break
+    # above the opening-range high (Rule 9A).
+    bgu_opening_range_minutes: int = Field(
+        default=15,
+        description=(
+            "Minutes after a gap-up open during which no LONG entry may fire. "
+            "Opening range is tracked over this window and becomes the "
+            "break-above trigger afterwards (Masterclass Rule 9A)."
+        ),
+    )
+
     # ── Moving Average Periods ────────────────────────────────
     ma_short: int = 50
     ma_medium: int = 150
