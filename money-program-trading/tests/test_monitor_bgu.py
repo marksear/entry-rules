@@ -248,6 +248,11 @@ class _StubClockPastCutoff:
     def is_past_entries_cutoff(self, now) -> bool:  # noqa: D401
         return True
 
+    def is_before_entries_open(self, now) -> bool:  # noqa: D401
+        # The entry window is open (post-opening-buffer). We're testing
+        # the upper-bound cutoff in isolation.
+        return False
+
     def must_hard_close(self, now) -> bool:  # unused here
         return False
 

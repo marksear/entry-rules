@@ -306,6 +306,122 @@ def test_classify_tick_without_clock_unchanged_behaviour():
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Entry-window LOWER bound (R_SESSION_PREMATURE)
+# ──────────────────────────────────────────────────────────────────────────
+# The opening 15 min of the session is amateur-hour chop. classify_tick
+# must suppress FIRE until entries_open_utc even if the technical trigger
+# has fired. See feedback_entry_window_lower_bound / TMUS 2026-04-24.
+
+
+def test_entries_open_utc_is_session_open_plus_opening_buffer():
+    """US session on 2026-04-17 (EDT): open 09:30 ET = 13:30 UTC;
+    entries_open_utc = 13:30 + 15 min = 13:45 UTC."""
+    clock = SessionClock.for_us_session(date(2026, 4, 17))
+    assert clock.entries_open_utc == datetime(2026, 4, 17, 13, 45, tzinfo=timezone.utc)
+
+
+def test_is_before_entries_open_true_at_market_open():
+    """13:30 UTC (09:30 ET) is BEFORE 13:45 UTC entries_open."""
+    clock = SessionClock.for_us_session(date(2026, 4, 17))
+    now = datetime(2026, 4, 17, 13, 30, tzinfo=timezone.utc)
+    assert clock.is_before_entries_open(now) is True
+
+
+def test_is_before_entries_open_false_at_boundary():
+    """Strictly before: at 13:45 UTC we're NOT before entries_open."""
+    clock = SessionClock.for_us_session(date(2026, 4, 17))
+    now = datetime(2026, 4, 17, 13, 45, tzinfo=timezone.utc)
+    assert clock.is_before_entries_open(now) is False
+
+
+def test_is_before_entries_open_false_mid_session():
+    """17:00 UTC is well past 13:45 entries_open."""
+    clock = SessionClock.for_us_session(date(2026, 4, 17))
+    now = datetime(2026, 4, 17, 17, 0, tzinfo=timezone.utc)
+    assert clock.is_before_entries_open(now) is False
+
+
+def test_classify_tick_rejects_with_r_session_premature_before_open():
+    """LONG candidate, non-gap day, price broken above trigger_high at
+    09:32 ET (inside the 15-min opening buffer). Under Rule 22 alone this
+    would FIRE. Under the R_SESSION_PREMATURE gate it must REJECT."""
+    plan = _make_plan()  # trigger_low=100, trigger_high=101
+    state = CandidateRuntimeState(
+        session_open_price=95.0,  # non-gap day
+        session_open_ts_utc=datetime(2026, 4, 17, 13, 30, tzinfo=timezone.utc),
+        gap_up_detected=False,
+    )
+    clock = SessionClock.for_us_session(date(2026, 4, 17))
+    # 09:32 ET = 13:32 UTC — inside the opening buffer.
+    now = datetime(2026, 4, 17, 13, 32, tzinfo=timezone.utc)
+
+    snap = {"last_traded": 101.25, "market_status": "TRADEABLE"}
+    outcome = classify_tick(plan, snap, state, session_clock=clock, now=now)
+
+    assert outcome.decision == Decision.REJECT
+    assert outcome.rejection_code == "R_SESSION_PREMATURE"
+
+
+def test_classify_tick_rejects_short_with_r_session_premature_before_open():
+    """SHORT symmetry — price broken below trigger_low in the opening
+    buffer must also REJECT with R_SESSION_PREMATURE."""
+    plan = _make_plan(
+        direction=Direction.SHORT,
+        trigger_low=99.0,
+        trigger_high=100.0,
+        stop_price=105.0,
+    )
+    state = CandidateRuntimeState()
+    clock = SessionClock.for_us_session(date(2026, 4, 17))
+    now = datetime(2026, 4, 17, 13, 32, tzinfo=timezone.utc)
+
+    snap = {"last_traded": 98.5, "market_status": "TRADEABLE"}
+    outcome = classify_tick(plan, snap, state, session_clock=clock, now=now)
+
+    assert outcome.decision == Decision.REJECT
+    assert outcome.rejection_code == "R_SESSION_PREMATURE"
+
+
+def test_classify_tick_fires_at_entries_open_boundary():
+    """Strict boundary: a tick exactly at 13:45 UTC (09:45 ET) is NOT
+    premature — the entry fires (assuming breakout + not past cutoff)."""
+    plan = _make_plan()
+    state = CandidateRuntimeState(
+        session_open_price=95.0,
+        session_open_ts_utc=datetime(2026, 4, 17, 13, 30, tzinfo=timezone.utc),
+        gap_up_detected=False,
+    )
+    clock = SessionClock.for_us_session(date(2026, 4, 17))
+    now = datetime(2026, 4, 17, 13, 45, tzinfo=timezone.utc)
+
+    snap = {"last_traded": 101.25, "market_status": "TRADEABLE"}
+    outcome = classify_tick(plan, snap, state, session_clock=clock, now=now)
+
+    assert outcome.decision == Decision.FIRE
+
+
+def test_r_session_premature_does_not_block_arm_or_hold():
+    """The lower bound suppresses FIRE only; ARM/HOLD keep firing so the
+    journal records state-of-the-candidate throughout the opening buffer."""
+    plan = _make_plan(trigger_low=100.0, trigger_high=101.0)
+    state = CandidateRuntimeState()
+    clock = SessionClock.for_us_session(date(2026, 4, 17))
+    now = datetime(2026, 4, 17, 13, 32, tzinfo=timezone.utc)  # before 13:45
+
+    # Inside arm band.
+    arm_snap = {"last_traded": 99.6, "market_status": "TRADEABLE"}
+    outcome = classify_tick(
+        plan, arm_snap, state, arm_band_pct=0.005, session_clock=clock, now=now,
+    )
+    assert outcome.decision == Decision.ARM
+
+    # Far from trigger → HOLD.
+    hold_snap = {"last_traded": 90.0, "market_status": "TRADEABLE"}
+    outcome = classify_tick(plan, hold_snap, state, session_clock=clock, now=now)
+    assert outcome.decision == Decision.HOLD
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # evaluate_exit integration
 # ──────────────────────────────────────────────────────────────────────────
 

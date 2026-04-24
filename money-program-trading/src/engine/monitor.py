@@ -356,6 +356,16 @@ def classify_tick(
         and now is not None
         and session_clock.is_past_entries_cutoff(now)
     )
+    # Session-clock opening buffer (lower bound). The opening 15 minutes
+    # of the session is amateur-hour chop — no new entries before
+    # entries_open_utc. Suppresses FIRE only; ARM/HOLD/NO_PRICE carry on
+    # for observability. The journal code is ``R_SESSION_PREMATURE``.
+    # See feedback_entry_window_lower_bound.
+    entries_premature = (
+        session_clock is not None
+        and now is not None
+        and session_clock.is_before_entries_open(now)
+    )
 
     if plan.direction == Direction.LONG:
         distance = last - plan.trigger_low  # ≥0 means price has entered zone
@@ -389,6 +399,12 @@ def classify_tick(
                         rejection_code="R22",
                         distance_pts=distance,
                     )
+            if entries_premature:
+                return TickOutcome(
+                    decision=Decision.REJECT,
+                    rejection_code="R_SESSION_PREMATURE",
+                    distance_pts=distance,
+                )
             if entries_cutoff_hit:
                 return TickOutcome(
                     decision=Decision.REJECT,
@@ -413,6 +429,12 @@ def classify_tick(
                 return TickOutcome(
                     decision=Decision.REJECT,
                     rejection_code="R22",
+                    distance_pts=distance,
+                )
+            if entries_premature:
+                return TickOutcome(
+                    decision=Decision.REJECT,
+                    rejection_code="R_SESSION_PREMATURE",
                     distance_pts=distance,
                 )
             if entries_cutoff_hit:
