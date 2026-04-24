@@ -41,6 +41,7 @@ from src.models.log_enums import (
     CandidateGrade,
     SessionLabel,
 )
+from src.utils.time_utils import utc_now
 
 pytestmark = pytest.mark.integration
 
@@ -164,7 +165,7 @@ def test_one_tick_writes_snapshot_row(
                 regime, schema_version
             ) VALUES (?, ?, ?, 0, 'DEMO', 'GREEN', 1)
             """,
-            (plan.scan_id, writer.session_id, datetime.utcnow().isoformat()),
+            (plan.scan_id, writer.session_id, utc_now().isoformat()),
         )
         database.conn.execute(
             """
@@ -184,7 +185,7 @@ def test_one_tick_writes_snapshot_row(
                 plan.trigger_low,
                 plan.trigger_high,
                 plan.stop_price,
-                datetime.utcnow().isoformat(),
+                utc_now().isoformat(),
             ),
         )
         database.conn.commit()
@@ -233,7 +234,7 @@ def test_short_loop_writes_multiple_ticks(
                 regime, schema_version
             ) VALUES (?, ?, ?, 0, 'DEMO', 'GREEN', 1)
             """,
-            (plan.scan_id, writer.session_id, datetime.utcnow().isoformat()),
+            (plan.scan_id, writer.session_id, utc_now().isoformat()),
         )
         database.conn.execute(
             """
@@ -253,7 +254,7 @@ def test_short_loop_writes_multiple_ticks(
                 plan.trigger_low,
                 plan.trigger_high,
                 plan.stop_price,
-                datetime.utcnow().isoformat(),
+                utc_now().isoformat(),
             ),
         )
         database.conn.commit()
@@ -264,7 +265,7 @@ def test_short_loop_writes_multiple_ticks(
             plans=[plan],
             tick_interval_seconds=1,
         )
-        end = datetime.utcnow() + timedelta(seconds=3)
+        end = utc_now() + timedelta(seconds=3)
         loop.run_until(end)
 
         count = database.conn.execute(

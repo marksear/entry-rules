@@ -72,7 +72,11 @@ class UniverseScoreEntry(BaseModel):
     )
 
     grade: str | None = Field(
-        default=None, description='"A+" / "A" / "B" / None if below B / not shortlisted.'
+        default=None,
+        description=(
+            '"A+" / "A" / "B" / "C" / None. A+/A/B are the production ladder; '
+            "C appears only on DEMO bypass runs."
+        ),
     )
     shortlisted: bool = False
     rejection_reason: str | None = None

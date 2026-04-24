@@ -121,6 +121,85 @@ def test_snapshot_defaults_scale_to_1_when_factor_missing():
     assert snap["bid"] == pytest.approx(8100.5)
 
 
+def test_snapshot_fallback_to_100_for_us_equity_with_missing_factor():
+    """2026-04-20 DEMO Day-1 regression: IG's /markets/{epic} response for
+    ``SC.D.FDX.DAILY.IP`` and ``SA.D.AMD.DAILY.IP`` came back with the
+    instrument block present (type=SHARES) but ``scalingFactor`` absent.
+    Raw minor-unit prices leaked through (39100.50 for $391 FDX) and
+    scan_anchor then rejected every entry as ~99% drift. The fallback:
+    when type is SHARES AND bid/ask look like minor units (>1500), assume
+    scalingFactor=100."""
+    ig = FakeIGService(
+        markets_response={
+            "instrument": {"type": "SHARES", "name": "FedEx Corp"},  # no scalingFactor
+            "snapshot": {
+                "bid": 39080.5,
+                "offer": 39120.0,
+                "lastTraded": 39100.5,
+                "marketStatus": "TRADEABLE",
+            },
+        }
+    )
+    md = _make_market_data(ig)
+
+    snap = md.get_market_snapshot("SC.D.FDX.DAILY.IP")
+
+    # Fallback must kick in, not leave raw minor units in place.
+    assert snap["scaling_factor"] == 100.0
+    assert snap["last_traded"] == pytest.approx(391.005)
+    assert snap["bid"] == pytest.approx(390.805)
+    assert snap["ask"] == pytest.approx(391.20)
+
+
+def test_snapshot_fallback_not_triggered_for_non_shares():
+    """FTSE-shape fixture: instrument type absent (or INDICES) must NOT
+    trigger the ×100 fallback even if prices happen to be above 1500.
+    FTSE legitimately trades at 8100 in native units."""
+    ig = FakeIGService(
+        markets_response={
+            "instrument": {"type": "INDICES", "name": "FTSE 100"},
+            "snapshot": {
+                "bid": 8100.5,
+                "offer": 8101.5,
+                "lastTraded": 8101.0,
+                "marketStatus": "TRADEABLE",
+            },
+        }
+    )
+    md = _make_market_data(ig)
+
+    snap = md.get_market_snapshot("IX.D.FTSE.DAILY.IP")
+
+    assert snap["scaling_factor"] == 1.0
+    assert snap["last_traded"] == pytest.approx(8101.0)
+    assert snap["bid"] == pytest.approx(8100.5)
+
+
+def test_snapshot_fallback_not_triggered_when_prices_normal():
+    """type=SHARES but raw bid/ask already in dollar range (< 1500) must
+    NOT trigger the ×100 fallback — falling through to 1.0 is correct when
+    the price already looks like a dollar figure (e.g. a $50 stock)."""
+    ig = FakeIGService(
+        markets_response={
+            "instrument": {"type": "SHARES", "name": "Small Cap Corp"},
+            "snapshot": {
+                "bid": 49.5,
+                "offer": 50.5,
+                "lastTraded": 50.0,
+                "marketStatus": "TRADEABLE",
+            },
+        }
+    )
+    md = _make_market_data(ig)
+
+    snap = md.get_market_snapshot("UA.D.SMCP.DAILY.IP")
+
+    # No fallback triggered — prices already in dollars, no evidence of
+    # minor-unit quoting. Default 1.0 is correct.
+    assert snap["scaling_factor"] == 1.0
+    assert snap["last_traded"] == pytest.approx(50.0)
+
+
 def test_snapshot_handles_zero_or_negative_scale_as_1():
     """A garbage scalingFactor must not divide-by-zero or invert prices."""
     ig = FakeIGService(

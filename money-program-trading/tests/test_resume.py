@@ -21,6 +21,7 @@ from src.engine.resume import rehydrate_open_positions
 from src.logging_mod.db import Database
 from src.logging_mod.session_writer import SessionWriter
 from src.models.log_enums import BrokerMode, SessionLabel
+from src.utils.time_utils import utc_now
 
 
 class _FakeMarketData:
@@ -55,8 +56,8 @@ def _insert_session(db: Database, session_id: str) -> None:
         """,
         (
             session_id,
-            datetime.utcnow().date().isoformat(),
-            datetime.utcnow().isoformat(),
+            utc_now().date().isoformat(),
+            utc_now().isoformat(),
         ),
     )
 
@@ -69,7 +70,7 @@ def _insert_scan(db: Database, scan_id: str, session_id: str) -> None:
             regime, schema_version
         ) VALUES (?, ?, ?, 0, 'DEMO', 'GREEN', 1)
         """,
-        (scan_id, session_id, datetime.utcnow().isoformat()),
+        (scan_id, session_id, utc_now().isoformat()),
     )
 
 
@@ -104,7 +105,7 @@ def _insert_shortlist(
             direction,
             stake,
             risk,
-            datetime.utcnow().isoformat(),
+            utc_now().isoformat(),
         ),
     )
 
@@ -130,7 +131,7 @@ def _insert_event(
             str(uuid.uuid4()),
             session_id,
             candidate_id,
-            (ts_utc or datetime.utcnow()).isoformat(),
+            (ts_utc or utc_now()).isoformat(),
             event_type,
             json.dumps(payload),
             terminal_reason,
@@ -147,7 +148,7 @@ def _insert_snapshot(db: Database, candidate_id: str, session_id: str) -> None:
             broker_mode, schema_version
         ) VALUES (?, ?, ?, 'AAPL', 'TRIGGERED_OPEN', 'DEMO', 1)
         """,
-        (session_id, candidate_id, datetime.utcnow().isoformat()),
+        (session_id, candidate_id, utc_now().isoformat()),
     )
 
 

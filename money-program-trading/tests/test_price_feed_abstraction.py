@@ -33,6 +33,7 @@ from src.data.price_feed import (
     Tick,
     build_price_feed,
 )
+from src.utils.time_utils import utc_now
 
 
 pytestmark = pytest.mark.unit
@@ -128,7 +129,7 @@ def test_tick_snapshot_dict_has_stable_keys_when_populated():
         epic="X.Y.Z", bid=1.0, ask=1.01, last_traded=1.005,
         market_status="TRADEABLE", high=1.02, low=0.99, net_change=0.01,
         pct_change=0.5, update_time_utc="09:30:00", scaling_factor=100.0,
-        updated_at_utc=datetime.utcnow(),
+        updated_at_utc=utc_now(),
     )
     d = t.as_snapshot_dict()
     assert set(d.keys()) == _EXPECTED_TICK_KEYS

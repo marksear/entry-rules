@@ -26,6 +26,7 @@ from .log_enums import (
     TargetHitReason,
     TerminalReason,
 )
+from ..utils.time_utils import utc_now
 from .session_record import LOG_SCHEMA_VERSION
 
 # --- Payload types ---------------------------------------------------------
@@ -282,6 +283,88 @@ class GateBypassActivePayload(_PayloadBase):
     scan_id: str
 
 
+# --- S-3 Phase 4a price-feed staleness payloads --------------------------
+
+
+class PriceStalePayload(_PayloadBase):
+    """Emitted every tick the monitor skipped evaluation because the feed's
+    ``latest()`` raised ``StalePriceError``. Short-glitch observability; not
+    paired with any terminal or close action on its own.
+
+    See docs/specs/S3_LIGHTSTREAMER_SPEC.md §7.2.
+    """
+
+    kind: Literal["PRICE_STALE"] = "PRICE_STALE"
+    epic: str
+    tick_age_seconds: float = Field(
+        ge=0.0,
+        description=(
+            "Age of the most recent cached tick, from the StalePriceError the "
+            "feed raised. 0 is permitted — callers may clamp +inf at emit time."
+        ),
+    )
+    stale_duration_seconds: float = Field(
+        ge=0.0,
+        description=(
+            "How long staleness has persisted on this epic since the first "
+            "stale tick of the current episode. Resets when a fresh tick "
+            "arrives (RECOVERED) or when escalated (DEGRADED)."
+        ),
+    )
+    has_open_position: bool = Field(
+        description="True if a position is open on the epic at this tick.",
+    )
+
+
+class PriceFeedDegradedPayload(_PayloadBase):
+    """Emitted once per degradation episode when stale duration exceeds
+    ``Settings.price_feed_degraded_seconds`` (default 60s). Not emitted per
+    tick — spec §7.2 table row for the 60s+ threshold.
+    """
+
+    kind: Literal["PRICE_FEED_DEGRADED"] = "PRICE_FEED_DEGRADED"
+    epic: str
+    stale_duration_seconds: float = Field(ge=0.0)
+    degraded_threshold_seconds: float = Field(ge=0.0)
+    had_open_position: bool = Field(
+        description=(
+            "Whether a position was open on this epic when degradation was "
+            "declared. When true, a POSITION_CLOSED_DEGRADED_FEED event "
+            "follows (if broker close succeeds)."
+        ),
+    )
+
+
+class PriceFeedRecoveredPayload(_PayloadBase):
+    """Emitted on the first fresh tick after a degradation episode. We do
+    NOT emit RECOVERED after transient (<60s) stale periods that never
+    escalated to DEGRADED — that would be log spam.
+    """
+
+    kind: Literal["PRICE_FEED_RECOVERED"] = "PRICE_FEED_RECOVERED"
+    epic: str
+    stale_duration_seconds: float = Field(
+        ge=0.0,
+        description="How long the degradation episode lasted (close-out).",
+    )
+
+
+class PositionClosedDegradedFeedPayload(_PayloadBase):
+    """Terminal close event fired by the defensive-close path when the
+    feed degrades while a position is open. Distinct from STOP_HIT /
+    TARGET_HIT / TRAIL_EXIT because the trigger was the *feed*, not the
+    price. Realised P&L is computed from the broker's actual close fill,
+    same as other terminal events.
+    """
+
+    kind: Literal["POSITION_CLOSED_DEGRADED_FEED"] = "POSITION_CLOSED_DEGRADED_FEED"
+    epic: str
+    deal_id: str
+    close_fill_price: float | None = None
+    realised_pnl_gbp: float | None = None
+    stale_duration_seconds: float = Field(ge=0.0)
+
+
 # Discriminated union of all payload shapes. `kind` field drives discrimination.
 EventPayload = Annotated[
     (
@@ -307,6 +390,10 @@ EventPayload = Annotated[
         | RejectedRiskBudgetPayload
         | PriceDivergenceSkipPayload
         | GateBypassActivePayload
+        | PriceStalePayload
+        | PriceFeedDegradedPayload
+        | PriceFeedRecoveredPayload
+        | PositionClosedDegradedFeedPayload
     ),
     Field(discriminator="kind"),
 ]
@@ -334,7 +421,7 @@ class CandidateEvent(BaseModel):
             "(REGIME_CHANGED with no candidate context) leave this as None."
         ),
     )
-    ts_utc: datetime = Field(default_factory=datetime.utcnow)
+    ts_utc: datetime = Field(default_factory=utc_now)
 
     event_type: EventType
     actor: ActorKind

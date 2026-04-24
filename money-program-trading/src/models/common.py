@@ -8,6 +8,7 @@ from datetime import datetime
 from enum import Enum
 
 from pydantic import BaseModel, Field
+from ..utils.time_utils import utc_now
 
 
 class Direction(str, Enum):
@@ -74,7 +75,7 @@ class TradeSignal(BaseModel):
     """
 
     signal_id: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
     ticker: str
     market: Market
     direction: Direction

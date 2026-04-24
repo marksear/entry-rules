@@ -76,6 +76,11 @@ class TerminalReason(str, Enum):
     # the session and was force-closed to avoid an overnight hold. Set by
     # ``evaluate_exit`` when ``SessionClock.hard_close_utc`` is crossed.
     HARD_CLOSE = "HARD_CLOSE"
+    # S-3 Phase 4a: price feed went silent (no fresh ticks) for longer than
+    # ``Settings.price_feed_degraded_seconds`` while a position was open.
+    # Monitor force-closed via broker REST rather than hold a position it
+    # couldn't see prices for. See docs/specs/S3_LIGHTSTREAMER_SPEC.md §7.2.
+    DEGRADED_FEED = "DEGRADED_FEED"
 
 
 # --- Grades (matches swing-committee's scorer output) ---
@@ -154,6 +159,34 @@ class EventType(str, Enum):
     # deal price by more than the configured threshold (or no deal price
     # was available). See ADD_DIVERGENCE_GATE_SPEC.md.
     PRICE_DIVERGENCE_SKIP = "PRICE_DIVERGENCE_SKIP"
+
+    # S-3 Phase 4a — price feed staleness escalation.
+    # See docs/specs/S3_LIGHTSTREAMER_SPEC.md §7.2.
+    #
+    # PRICE_STALE — feed's latest() raised StalePriceError this tick
+    # (cached tick older than the feed's ``stale_seconds`` threshold,
+    # typically 10s). Monitor skipped trigger/exit evaluation for this
+    # tick; emitted every stale tick for observability. Harmless short
+    # glitches (<60s) don't escalate.
+    PRICE_STALE = "PRICE_STALE"
+    # PRICE_FEED_DEGRADED — staleness exceeded the feed's
+    # ``degraded_seconds`` threshold (typically 60s). Emitted once per
+    # degradation episode (not per tick) to avoid log spam. When a
+    # position is open on the epic, this event is paired with a
+    # defensive close + POSITION_CLOSED_DEGRADED_FEED.
+    PRICE_FEED_DEGRADED = "PRICE_FEED_DEGRADED"
+    # PRICE_FEED_RECOVERED — fresh tick arrived after a degradation
+    # episode. Emitted once on the transition so post-session analysis
+    # can pair DEGRADED → RECOVERED intervals. Not emitted for stale
+    # periods that never escalated to DEGRADED (to keep the event
+    # stream quiet on routine <60s glitches).
+    PRICE_FEED_RECOVERED = "PRICE_FEED_RECOVERED"
+    # POSITION_CLOSED_DEGRADED_FEED — terminal close event emitted when
+    # defensive-close fires at the 60s threshold. Uses broker REST
+    # (independent of the stale feed). Carries the same realised_pnl_gbp
+    # + close_fill_price fields as other terminal events so journals
+    # treat it uniformly.
+    POSITION_CLOSED_DEGRADED_FEED = "POSITION_CLOSED_DEGRADED_FEED"
 
     # Session-level — governance / bypass
     GATE_BYPASS_ACTIVE = "GATE_BYPASS_ACTIVE"

@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .common import Direction, EntryType, Market
 from .log_enums import BrokerMode, CandidateGrade
 from .session_record import LOG_SCHEMA_VERSION
+from ..utils.time_utils import utc_now
 
 
 class PillarVotes(BaseModel):
@@ -129,7 +130,7 @@ class ShortlistEntry(BaseModel):
 
     # Provenance
     broker_mode: BrokerMode
-    created_at_utc: datetime = Field(default_factory=datetime.utcnow)
+    created_at_utc: datetime = Field(default_factory=utc_now)
     schema_version: int = LOG_SCHEMA_VERSION
     rule_set_version: str = ""
 

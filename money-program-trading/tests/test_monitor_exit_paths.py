@@ -42,6 +42,7 @@ from src.engine.monitor import (
     CandidateRuntimeState,
     MonitorLoop,
 )
+from src.utils.time_utils import utc_now
 from src.engine.trail_manager import ExitConfig
 from src.logging_mod.db import Database
 from src.logging_mod.session_writer import SessionWriter
@@ -112,7 +113,7 @@ class MockBroker:
             success=self.close_should_succeed,
             deal_id=deal_id,
             fill_price=self.close_fill_price,
-            closed_at_utc=datetime.utcnow(),
+            closed_at_utc=utc_now(),
             reason_code="SUCCESS" if self.close_should_succeed else "REJECTED",
         )
 
@@ -190,7 +191,7 @@ def _insert_prereq_rows(
             regime, schema_version
         ) VALUES (?, ?, ?, 0, 'DEMO', 'GREEN', 1)
         """,
-        (plan.scan_id, writer.session_id, datetime.utcnow().isoformat()),
+        (plan.scan_id, writer.session_id, utc_now().isoformat()),
     )
     database.conn.execute(
         """
@@ -212,7 +213,7 @@ def _insert_prereq_rows(
             plan.stop_price,
             plan.planned_stake_gbp_per_pt,
             plan.planned_risk_gbp,
-            datetime.utcnow().isoformat(),
+            utc_now().isoformat(),
         ),
     )
     database.conn.commit()

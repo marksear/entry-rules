@@ -37,6 +37,7 @@ from src.models import (
     SessionLabel,
     ShortlistEntry,
 )
+from src.utils.time_utils import utc_now
 from src.models.candidate_event import GateBypassActivePayload
 
 # ---------------------------------------------------------------------------
@@ -255,7 +256,7 @@ def test_gate_bypass_active_payload_round_trip():
         id=str(uuid4()),
         session_id=str(uuid4()),
         candidate_id=None,  # session-level event
-        ts_utc=datetime.utcnow(),
+        ts_utc=utc_now(),
         event_type=EventType.GATE_BYPASS_ACTIVE,
         actor=ActorKind.INGESTER,
         payload=payload,

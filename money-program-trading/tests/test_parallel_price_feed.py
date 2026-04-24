@@ -23,6 +23,7 @@ from src.data.price_feed import (
     StalePriceError,
     Tick,
 )
+from src.utils.time_utils import utc_now
 
 
 pytestmark = pytest.mark.unit
@@ -38,7 +39,7 @@ def _tick(epic: str, bid: float, ask: float, age_s: float = 0.0) -> Tick:
         epic=epic, bid=bid, ask=ask, last_traded=(bid + ask) / 2,
         market_status="TRADEABLE", high=None, low=None, net_change=None,
         pct_change=None, update_time_utc=None, scaling_factor=1.0,
-        updated_at_utc=datetime.utcnow() - timedelta(seconds=age_s),
+        updated_at_utc=utc_now() - timedelta(seconds=age_s),
     )
 
 

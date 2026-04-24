@@ -51,6 +51,7 @@ from .models.candidate_event import (
     GateBypassActivePayload,
     ShortlistAddedPayload,
 )
+from .utils.time_utils import utc_now
 from .models.common import Direction, EntryType, Market
 from .models.log_enums import (
     ActorKind,
@@ -222,7 +223,7 @@ def _emit_gate_bypass_active_event(writer: SessionWriter) -> None:
         id=str(uuid4()),
         session_id=writer.session_id,
         candidate_id=None,  # session-level, not per-candidate
-        ts_utc=datetime.utcnow(),
+        ts_utc=utc_now(),
         event_type=EventType.GATE_BYPASS_ACTIVE,
         actor=ActorKind.INGESTER,
         payload=GateBypassActivePayload(
@@ -248,7 +249,7 @@ def _emit_shortlist_added_events(
     """One SHORTLIST_ADDED event per candidate, written in a single batch."""
     if not plans:
         return
-    now = datetime.utcnow()
+    now = utc_now()
     events = [
         CandidateEvent(
             id=str(uuid4()),
@@ -402,7 +403,7 @@ def run(args: argparse.Namespace) -> int:
                     logger.info("--dry-run: exiting after ingest + SHORTLIST_ADDED events.")
                     return 0
 
-                end_time = datetime.utcnow() + timedelta(minutes=args.duration_mins)
+                end_time = utc_now() + timedelta(minutes=args.duration_mins)
                 # market_data is passed to Broker so order-placement and
                 # stop-modify calls scale stop_level/stop_distance/limit_level
                 # into IG's quoted units using each epic's scalingFactor.

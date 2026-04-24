@@ -13,6 +13,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from .log_enums import BrokerMode, SessionLabel
+from ..utils.time_utils import utc_now
 
 LOG_SCHEMA_VERSION = 2
 """Observability log schema version. Bump on any breaking change to the five
@@ -48,7 +49,7 @@ class SessionRecord(BaseModel):
         ),
     )
 
-    opened_at_utc: datetime = Field(default_factory=datetime.utcnow)
+    opened_at_utc: datetime = Field(default_factory=utc_now)
     closed_at_utc: datetime | None = None
 
     scan_id: str | None = Field(

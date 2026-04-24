@@ -45,6 +45,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import TYPE_CHECKING
+from ..utils.time_utils import utc_now
 
 try:
     from zoneinfo import ZoneInfo
@@ -235,7 +236,7 @@ class SessionClock:
 def _as_utc(dt: datetime) -> datetime:
     """Coerce naive datetimes (assumed UTC) to tz-aware UTC.
 
-    ``datetime.utcnow()`` returns naive datetimes everywhere else in the
+    ``utc_now()`` returns naive datetimes everywhere else in the
     codebase; accept those as UTC rather than forcing a cascade of
     rewrites.
     """

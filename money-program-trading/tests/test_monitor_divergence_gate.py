@@ -37,6 +37,7 @@ from src.engine.monitor import (
     CandidateRuntimeState,
     MonitorLoop,
 )
+from src.utils.time_utils import utc_now
 from src.engine.trail_manager import (
     PRICE_DIVERGENCE_SKIP_BPS,
     PRICE_DIVERGENCE_SKIP_WARN_AFTER_TICKS,
@@ -108,7 +109,7 @@ class _DivergenceBroker:
             success=True,
             deal_id=deal_id,
             fill_price=None,
-            closed_at_utc=datetime.utcnow(),
+            closed_at_utc=utc_now(),
             reason_code="SUCCESS",
         )
 

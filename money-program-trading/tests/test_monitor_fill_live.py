@@ -48,6 +48,7 @@ from src.models.log_enums import (
     EventType,
     SessionLabel,
 )
+from src.utils.time_utils import utc_now
 
 pytestmark = pytest.mark.integration
 
@@ -101,7 +102,7 @@ def _insert_prereq_rows(
             regime, schema_version
         ) VALUES (?, ?, ?, 0, 'DEMO', 'GREEN', 1)
         """,
-        (plan.scan_id, writer.session_id, datetime.utcnow().isoformat()),
+        (plan.scan_id, writer.session_id, utc_now().isoformat()),
     )
     database.conn.execute(
         """
@@ -123,7 +124,7 @@ def _insert_prereq_rows(
             plan.stop_price,
             plan.planned_stake_gbp_per_pt,
             plan.planned_risk_gbp,
-            datetime.utcnow().isoformat(),
+            utc_now().isoformat(),
         ),
     )
     database.conn.commit()

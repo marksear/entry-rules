@@ -16,6 +16,7 @@ import pytest
 
 from src.logging_mod.db import Database
 from src.reporting.journal import write_session_journal
+from src.utils.time_utils import utc_now
 
 
 @pytest.fixture
@@ -62,7 +63,7 @@ def _insert_scan(db: Database, scan_id: str, session_id: str) -> None:
             regime, schema_version
         ) VALUES (?, ?, ?, 0, 'DEMO', 'GREEN', 1)
         """,
-        (scan_id, session_id, datetime.utcnow().isoformat()),
+        (scan_id, session_id, utc_now().isoformat()),
     )
 
 
@@ -92,7 +93,7 @@ def _insert_shortlist(
             symbol,
             direction,
             grade,
-            datetime.utcnow().isoformat(),
+            utc_now().isoformat(),
         ),
     )
 
@@ -119,7 +120,7 @@ def _insert_event(
             str(uuid.uuid4()),
             session_id,
             candidate_id,
-            (ts_utc or datetime.utcnow()).isoformat(),
+            (ts_utc or utc_now()).isoformat(),
             event_type,
             json.dumps(payload),
             terminal_reason,

@@ -43,7 +43,9 @@ from uuid import uuid4
 from typing import TYPE_CHECKING
 
 from ..data.market_data import MarketData
+from ..data.price_feed import StalePriceError
 from ..logging_mod.session_writer import SessionWriter
+from ..utils.time_utils import utc_now
 
 if TYPE_CHECKING:
     from .session_clock import SessionClock
@@ -54,7 +56,11 @@ from ..models.candidate_event import (
     HardCloseExitPayload,
     InvalidationExitPayload,
     OrderPlacedPayload,
+    PositionClosedDegradedFeedPayload,
     PriceDivergenceSkipPayload,
+    PriceFeedDegradedPayload,
+    PriceFeedRecoveredPayload,
+    PriceStalePayload,
     SessionEndedNoTriggerPayload,
     StopHitPayload,
     StopMovedPayload,
@@ -173,6 +179,18 @@ class CandidateRuntimeState:
     # price was available). Reset to 0 on a tick where the delta came
     # back within threshold — i.e., the feed recovered.
     consecutive_divergence_skips: int = 0
+
+    # S-3 Phase 4a — per-epic staleness tracking --------------------
+    # First time the monitor observed a StalePriceError for this epic.
+    # None means: either we've never been stale, or the last episode
+    # already recovered. Set on the first stale tick; cleared when a
+    # fresh tick arrives after a DEGRADED episode. See monitor's
+    # ``_handle_stale_tick`` / ``_emit_price_feed_recovered`` flow.
+    stale_since_utc: datetime | None = None
+    # True iff we've already fired PRICE_FEED_DEGRADED for the current
+    # stale episode. Prevents the degraded event from firing every tick;
+    # reset alongside stale_since_utc on recovery.
+    degraded_emitted: bool = False
 
     def has_close_event(self) -> bool:
         """True if terminal state was reached via a broker-close path.
@@ -328,7 +346,13 @@ class MonitorLoop:
     session_clock: "SessionClock | None" = None
     tick_interval_seconds: int = 60
     arm_band_pct: float = DEFAULT_ARM_BAND_PCT
-    now_fn: Callable[[], datetime] = field(default=datetime.utcnow)
+    # S-3 Phase 4a staleness escalation threshold. When the price feed
+    # has been raising StalePriceError for this many seconds on an epic
+    # with an open position, the monitor force-closes via broker REST
+    # and emits POSITION_CLOSED_DEGRADED_FEED. Matches the default in
+    # Settings.price_feed_degraded_seconds.
+    price_feed_degraded_seconds: float = 60.0
+    now_fn: Callable[[], datetime] = field(default=utc_now)
 
     _runtime: dict[str, CandidateRuntimeState] = field(default_factory=dict, init=False)
     _stop_requested: bool = field(default=False, init=False)
@@ -443,7 +467,26 @@ class MonitorLoop:
                 # Already closed — don't poll or write further snapshots.
                 continue
 
-            snapshot = self._safe_fetch(plan.ig_epic)
+            # Fetch this tick. StalePriceError propagates up separately
+            # so the staleness-escalation path (S-3 Phase 4a) can track
+            # per-epic stale duration; generic exceptions are swallowed
+            # into an empty snapshot the way they always were.
+            try:
+                snapshot = self._safe_fetch(plan.ig_epic)
+            except StalePriceError as stale:
+                self._handle_stale_tick(plan, state, stale, now)
+                state.last_snapshot_ts = now
+                continue
+
+            # Got a fresh snapshot. If the previous tick on this epic
+            # was stale enough to have emitted PRICE_FEED_DEGRADED, emit
+            # PRICE_FEED_RECOVERED now so post-session analysis can pair
+            # the episode. Transient sub-60s glitches don't emit RECOVERY.
+            if state.stale_since_utc is not None:
+                if state.degraded_emitted:
+                    self._emit_price_feed_recovered(plan, state, now)
+                state.stale_since_utc = None
+                state.degraded_emitted = False
 
             if not state.fired:
                 self._handle_pre_trigger_tick(plan, state, snapshot, now)
@@ -461,11 +504,233 @@ class MonitorLoop:
             state.last_snapshot_ts = now
 
     def _safe_fetch(self, epic: str) -> dict:
+        """Fetch a snapshot, swallowing generic errors but letting
+        ``StalePriceError`` propagate so the S-3 Phase 4a staleness
+        escalation in ``run_one_tick`` can track it."""
         try:
             return self.market_data.get_market_snapshot(epic)
+        except StalePriceError:
+            raise
         except Exception as e:
             logger.warning("Snapshot fetch failed for %s: %s", epic, e)
             return {}
+
+    # ------------------------------------------------------------------
+    # S-3 Phase 4a — staleness escalation
+    # ------------------------------------------------------------------
+
+    def _handle_stale_tick(
+        self,
+        plan: CandidatePlan,
+        state: CandidateRuntimeState,
+        exc: StalePriceError,
+        now: datetime,
+    ) -> None:
+        """Orchestrate the staleness ladder per spec §7.2.
+
+        * Record the first stale timestamp for the episode.
+        * Emit ``PRICE_STALE`` every stale tick (observability).
+        * When stale duration crosses ``price_feed_degraded_seconds``,
+          emit ``PRICE_FEED_DEGRADED`` (once) and, if a position is open
+          on this epic, force-close via broker REST + emit
+          ``POSITION_CLOSED_DEGRADED_FEED``.
+        """
+        if state.stale_since_utc is None:
+            state.stale_since_utc = now
+        stale_duration = max(0.0, (now - state.stale_since_utc).total_seconds())
+
+        has_open_position = (
+            state.fired
+            and state.fill_ts_utc is not None
+            and state.deal_id is not None
+            and not state.has_close_event()
+        )
+
+        self._emit_price_stale(
+            plan, state, exc, stale_duration, has_open_position, now,
+        )
+
+        if (
+            stale_duration >= self.price_feed_degraded_seconds
+            and not state.degraded_emitted
+        ):
+            state.degraded_emitted = True
+            self._emit_price_feed_degraded(
+                plan, state, stale_duration, has_open_position, now,
+            )
+            if has_open_position:
+                self._defensive_close(plan, state, stale_duration, now)
+
+    def _defensive_close(
+        self,
+        plan: CandidatePlan,
+        state: CandidateRuntimeState,
+        stale_duration: float,
+        now: datetime,
+    ) -> None:
+        """Close an open position at IG because the price feed has been
+        degraded too long. Same failure-tolerance shape as
+        ``_handle_exit``: a broker close_position error does NOT mark
+        the plan terminal (the Day-1 silent-failure-mode fix) — next
+        tick re-evaluates and retries."""
+        if self.broker is None or not state.deal_id:
+            logger.error(
+                "DEGRADED-CLOSE skipped for %s: no broker or deal_id "
+                "(broker=%s, deal_id=%s).",
+                plan.symbol, self.broker, state.deal_id,
+            )
+            return
+
+        close = self.broker.close_position(
+            deal_id=state.deal_id,
+            direction=plan.direction,
+            epic=plan.ig_epic,
+            size=state.stake_gbp_per_pt or 0.0,
+        )
+        if not close.success:
+            state.consecutive_close_failures += 1
+            logger.error(
+                "DEGRADED-CLOSE FAILED for %s (deal_id=%s): %s — attempt #%d. "
+                "Plan remains tickable; next tick retries. Position may "
+                "still be live at IG; staleness persists.",
+                plan.symbol, state.deal_id, close.reason_code,
+                state.consecutive_close_failures,
+            )
+            return
+
+        state.consecutive_close_failures = 0
+        close_fill_price = close.fill_price
+        realised_pnl = self._realised_pnl_gbp(plan, state, close_fill_price, None)
+        self._emit_position_closed_degraded_feed(
+            plan, state, close_fill_price, realised_pnl, stale_duration, now,
+        )
+        state.terminal = True
+        state.terminal_reason = TerminalReason.DEGRADED_FEED
+        logger.warning(
+            "DEGRADED-CLOSE: %s %s — realised_pnl=%.2f GBP, "
+            "stale_duration=%.1fs.",
+            plan.symbol, plan.direction.value, realised_pnl, stale_duration,
+        )
+
+    # ─── Emit helpers for the four new events ──────────────────
+
+    def _emit_price_stale(
+        self,
+        plan: CandidatePlan,
+        state: CandidateRuntimeState,
+        exc: StalePriceError,
+        stale_duration: float,
+        has_open_position: bool,
+        now: datetime,
+    ) -> None:
+        # StalePriceError.age_seconds can be inf (no tick yet); clamp at
+        # a large finite value so the pydantic payload (float, ge=0)
+        # doesn't choke. 99_999 is ~27 hours, far beyond any realistic
+        # session, so losing precision here is harmless.
+        age = exc.age_seconds
+        if age == float("inf"):
+            age = 99_999.0
+        payload = PriceStalePayload(
+            epic=plan.ig_epic,
+            tick_age_seconds=age,
+            stale_duration_seconds=stale_duration,
+            has_open_position=has_open_position,
+        )
+        event = CandidateEvent(
+            session_id=self.writer.session_id,
+            candidate_id=plan.candidate_id,
+            ts_utc=now,
+            event_type=EventType.PRICE_STALE,
+            actor=ActorKind.EXECUTOR,
+            broker_mode=BrokerMode(self.writer.broker_mode.value),
+            schema_version=CandidateEvent.model_fields["schema_version"].default,
+            rule_set_version=self.writer.rule_set_version,
+            payload=payload,
+        )
+        self.writer.write_events([event])
+
+    def _emit_price_feed_degraded(
+        self,
+        plan: CandidatePlan,
+        state: CandidateRuntimeState,
+        stale_duration: float,
+        had_open_position: bool,
+        now: datetime,
+    ) -> None:
+        payload = PriceFeedDegradedPayload(
+            epic=plan.ig_epic,
+            stale_duration_seconds=stale_duration,
+            degraded_threshold_seconds=float(self.price_feed_degraded_seconds),
+            had_open_position=had_open_position,
+        )
+        event = CandidateEvent(
+            session_id=self.writer.session_id,
+            candidate_id=plan.candidate_id,
+            ts_utc=now,
+            event_type=EventType.PRICE_FEED_DEGRADED,
+            actor=ActorKind.EXECUTOR,
+            broker_mode=BrokerMode(self.writer.broker_mode.value),
+            schema_version=CandidateEvent.model_fields["schema_version"].default,
+            rule_set_version=self.writer.rule_set_version,
+            payload=payload,
+        )
+        self.writer.write_events([event])
+
+    def _emit_price_feed_recovered(
+        self,
+        plan: CandidatePlan,
+        state: CandidateRuntimeState,
+        now: datetime,
+    ) -> None:
+        stale_duration = 0.0
+        if state.stale_since_utc is not None:
+            stale_duration = max(0.0, (now - state.stale_since_utc).total_seconds())
+        payload = PriceFeedRecoveredPayload(
+            epic=plan.ig_epic,
+            stale_duration_seconds=stale_duration,
+        )
+        event = CandidateEvent(
+            session_id=self.writer.session_id,
+            candidate_id=plan.candidate_id,
+            ts_utc=now,
+            event_type=EventType.PRICE_FEED_RECOVERED,
+            actor=ActorKind.EXECUTOR,
+            broker_mode=BrokerMode(self.writer.broker_mode.value),
+            schema_version=CandidateEvent.model_fields["schema_version"].default,
+            rule_set_version=self.writer.rule_set_version,
+            payload=payload,
+        )
+        self.writer.write_events([event])
+
+    def _emit_position_closed_degraded_feed(
+        self,
+        plan: CandidatePlan,
+        state: CandidateRuntimeState,
+        close_fill_price: float | None,
+        realised_pnl_gbp: float | None,
+        stale_duration: float,
+        now: datetime,
+    ) -> None:
+        payload = PositionClosedDegradedFeedPayload(
+            epic=plan.ig_epic,
+            deal_id=state.deal_id or "",
+            close_fill_price=close_fill_price,
+            realised_pnl_gbp=realised_pnl_gbp,
+            stale_duration_seconds=stale_duration,
+        )
+        event = CandidateEvent(
+            session_id=self.writer.session_id,
+            candidate_id=plan.candidate_id,
+            ts_utc=now,
+            event_type=EventType.POSITION_CLOSED_DEGRADED_FEED,
+            actor=ActorKind.EXECUTOR,
+            broker_mode=BrokerMode(self.writer.broker_mode.value),
+            schema_version=CandidateEvent.model_fields["schema_version"].default,
+            rule_set_version=self.writer.rule_set_version,
+            terminal_reason=TerminalReason.DEGRADED_FEED,
+            payload=payload,
+        )
+        self.writer.write_events([event])
 
     # ------------------------------------------------------------------
     # Pre-trigger path
@@ -1516,6 +1781,11 @@ _CLOSE_TERMINAL_REASONS: frozenset[TerminalReason] = frozenset({
     TerminalReason.TRAIL_EXIT,
     TerminalReason.INVALIDATION_EXIT,
     TerminalReason.HARD_CLOSE,
+    # S-3 Phase 4a: defensive close fires via broker.close_position when
+    # the price feed degrades >60s with a position open. Treat the
+    # resulting terminal state as a real close event so the invariant
+    # backstop doesn't mis-flag it as the TERMINAL-on-open-position bug.
+    TerminalReason.DEGRADED_FEED,
 })
 
 

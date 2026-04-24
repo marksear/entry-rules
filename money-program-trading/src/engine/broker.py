@@ -40,6 +40,7 @@ from trading_ig.rest import IGException
 
 from ..auth.ig_auth import IGSession
 from ..models.common import Direction
+from ..utils.time_utils import utc_now
 
 if TYPE_CHECKING:
     from ..data.market_data import MarketData
@@ -643,7 +644,7 @@ class Broker:
             success=ok,
             deal_id=deal_id,
             fill_price=fill_price,
-            closed_at_utc=datetime.utcnow(),
+            closed_at_utc=utc_now(),
             reason_code=reason if not ok else "SUCCESS",
             raw=confirm,
         )

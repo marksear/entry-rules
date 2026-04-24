@@ -32,6 +32,7 @@ from src.data.price_feed import (
     StalePriceError,
     Tick,
 )
+from src.utils.time_utils import utc_now
 
 
 pytestmark = pytest.mark.unit
@@ -282,7 +283,7 @@ def test_latest_returns_tick_when_fresh():
         epic="UA.D.AAPL.DAILY.IP", bid=100.0, ask=100.1, last_traded=100.05,
         market_status="TRADEABLE", high=101.0, low=99.5, net_change=0.5,
         pct_change=0.5, update_time_utc="14:00:00", scaling_factor=1.0,
-        updated_at_utc=datetime.utcnow(),
+        updated_at_utc=utc_now(),
     )
     feed._tick_cache["UA.D.AAPL.DAILY.IP"] = fresh
     result = feed.latest("UA.D.AAPL.DAILY.IP")
@@ -298,7 +299,7 @@ def test_latest_raises_when_tick_older_than_max_age():
         epic="UA.D.AAPL.DAILY.IP", bid=100.0, ask=100.1, last_traded=100.05,
         market_status="TRADEABLE", high=None, low=None, net_change=None,
         pct_change=None, update_time_utc="14:00:00", scaling_factor=1.0,
-        updated_at_utc=datetime.utcnow() - timedelta(seconds=30),
+        updated_at_utc=utc_now() - timedelta(seconds=30),
     )
     feed._tick_cache["UA.D.AAPL.DAILY.IP"] = stale
     with pytest.raises(StalePriceError) as exc:
@@ -315,7 +316,7 @@ def test_latest_max_age_override_extends_tolerance():
         epic="UK.D.FTSE.DAILY.IP", bid=8100.0, ask=8101.0, last_traded=8100.5,
         market_status="TRADEABLE", high=None, low=None, net_change=None,
         pct_change=None, update_time_utc="14:00:00", scaling_factor=1.0,
-        updated_at_utc=datetime.utcnow() - timedelta(seconds=20),
+        updated_at_utc=utc_now() - timedelta(seconds=20),
     )
     feed._tick_cache["UK.D.FTSE.DAILY.IP"] = older
     # Default stale_seconds=5 would raise; override to 120 returns the tick

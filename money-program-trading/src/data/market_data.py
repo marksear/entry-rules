@@ -36,6 +36,7 @@ from ..auth.ig_auth import IGSession
 from .price_feed import PriceFeed, RestPriceFeed, Tick
 # Re-export scaling helpers for any historical import paths.
 from .scaling import _looks_like_equity_spreadbet, _looks_like_minor_units  # noqa: F401
+from ..utils.time_utils import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -259,7 +260,7 @@ class MarketData:
         if cached is not None and len(cached) >= num_bars - 5:
             # Incremental update: only fetch bars since last cached date
             last_date = cached.index[-1]
-            days_missing = (datetime.utcnow() - last_date.to_pydatetime()).days
+            days_missing = (utc_now() - last_date.to_pydatetime()).days
             if days_missing <= 1:
                 return cached.tail(num_bars)
 

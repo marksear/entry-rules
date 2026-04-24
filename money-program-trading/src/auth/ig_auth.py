@@ -15,9 +15,10 @@ import time
 from datetime import datetime, timedelta
 
 from trading_ig import IGService
-from trading_ig.rest import IGException, TokenInvalidException
+from trading_ig.rest import IGException
 
 from ..config.settings import Settings, get_settings
+from ..utils.time_utils import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +87,7 @@ class IGSession:
 
         try:
             self._service.create_session()
-            self._connected_at = datetime.utcnow()
+            self._connected_at = utc_now()
             logger.info("IG session established at %s", self._connected_at.isoformat())
 
             # Switch to configured account if specified
@@ -155,7 +156,7 @@ class IGSession:
     def _needs_refresh(self) -> bool:
         if self._connected_at is None:
             return True
-        elapsed = datetime.utcnow() - self._connected_at
+        elapsed = utc_now() - self._connected_at
         return elapsed > timedelta(minutes=SESSION_REFRESH_MINUTES)
 
     def _refresh(self) -> None:
@@ -168,24 +169,37 @@ class IGSession:
         time.sleep(1)
         self.connect()
 
-    def _switch_account(self, account_id: str) -> None:
+    def _switch_account(self, account_id: str, _retries_left: int = 1) -> None:
         """Switch to a specific IG account (CFD, spread bet, etc.).
 
         trading-ig's ``IGService.switch_account`` requires a ``default_account``
         flag — we always pass ``False`` because we're switching for the
         duration of this process only, not permanently flipping the default
         on IG's side.
+
+        Retries once with a short sleep on ANY exception — IG DEMO often 401s
+        the first switch call right after ``create_session`` (token-warmup
+        race). Recent versions of trading-ig raise plain ``Exception`` rather
+        than the typed ``TokenInvalidException``, so we catch broadly.
         """
         try:
             self._service.switch_account(account_id, False)
             logger.info("Switched to account: %s", account_id)
-        except (IGException, TokenInvalidException) as e:
-            # IG DEMO sometimes 401s the switch call right after create_session
-            # (rate-limit / token-warmup race). Swallow it — if we're already on
-            # the right account the subsequent calls will just succeed; if not,
-            # the balance / fetch_accounts warning below will surface it.
+        except Exception as e:
+            if _retries_left > 0:
+                logger.warning(
+                    "switch_account failed (%s: %s); retrying in 2s (token-warmup race)",
+                    type(e).__name__,
+                    e,
+                )
+                time.sleep(2)
+                self._switch_account(account_id, _retries_left=_retries_left - 1)
+                return
+            # Swallow with warning — if we're already on the right account,
+            # subsequent calls will succeed; if not, the balance /
+            # fetch_accounts warnings below will surface it.
             logger.warning(
-                "Could not switch to account %s: %s: %s",
+                "Could not switch to account %s after retry: %s: %s",
                 account_id,
                 type(e).__name__,
                 e,

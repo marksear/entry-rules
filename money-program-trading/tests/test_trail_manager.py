@@ -29,6 +29,7 @@ from src.engine.trail_manager import (
     evaluate_exit,
     unrealised_pnl_gbp,
 )
+from src.utils.time_utils import utc_now
 from src.models.common import Direction, EntryType, Market
 from src.models.log_enums import BrokerMode, CandidateGrade
 
@@ -194,7 +195,7 @@ def test_trail_stop_scales_with_stake():
 
 
 def test_empty_snapshot_is_no_price():
-    out = evaluate_exit(_long_plan(), _long_position(), {}, datetime.utcnow(), CFG)
+    out = evaluate_exit(_long_plan(), _long_position(), {}, utc_now(), CFG)
     assert out.action == ExitAction.NO_PRICE
 
 
@@ -203,7 +204,7 @@ def test_market_closed_is_no_price():
         _long_plan(),
         _long_position(),
         _snap(100.0, status="CLOSED"),
-        datetime.utcnow(),
+        utc_now(),
         CFG,
     )
     assert out.action == ExitAction.NO_PRICE
@@ -214,7 +215,7 @@ def test_missing_last_traded_is_no_price():
         _long_plan(),
         _long_position(),
         _snap(None),
-        datetime.utcnow(),
+        utc_now(),
         CFG,
     )
     assert out.action == ExitAction.NO_PRICE

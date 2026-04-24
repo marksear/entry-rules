@@ -34,6 +34,7 @@ from ..logging_mod.db import Database
 from ..models.audit_entry import (
     AuditEntry, AuditGates, AuditLevels, AuditVolume, AuditTranche,
 )
+from ..utils.time_utils import utc_now
 from ..models.common import Decision, Direction, EntryType, Market
 from ..utils.spread_bet import (
     calculate_spread_bet_size,
@@ -324,7 +325,7 @@ class WatchlistProcessor:
                     t["status"] = idea.status
                     t["ig_epic"] = idea.ig_epic
                     t["rejection"] = idea.rejection
-                    t["last_checked"] = datetime.utcnow().isoformat()
+                    t["last_checked"] = utc_now().isoformat()
                     break
 
         with open(self._watchlist_path, "w") as f:

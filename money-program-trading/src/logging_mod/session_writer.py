@@ -51,6 +51,7 @@ from ..models.scan_record import ScanRecord
 from ..models.session_record import LOG_SCHEMA_VERSION, SessionRecord
 from ..models.shortlist_entry import ShortlistEntry
 from .db import Database
+from ..utils.time_utils import utc_now
 
 if TYPE_CHECKING:
     from ..data.market_data import MarketData
@@ -134,7 +135,7 @@ class SessionWriter:
 
     def __enter__(self) -> SessionWriter:
         self.database.initialize()
-        self._opened_at = datetime.utcnow()
+        self._opened_at = utc_now()
         self.session_id = str(uuid4())
         record = SessionRecord(
             session_id=self.session_id,
@@ -199,7 +200,7 @@ class SessionWriter:
             self._closed = True
             return
 
-        closed_at = datetime.utcnow().isoformat()
+        closed_at = utc_now().isoformat()
         if notes is not None:
             self.database.conn.execute(
                 """
@@ -311,10 +312,31 @@ class SessionWriter:
                 )
 
         # Price grounding — reject LLM-hallucinated levels before they
-        # poison the session. Skipped when market_data is None (unit
-        # tests / offline replay).
+        # poison the session. Skipped when:
+        #   * market_data is None (unit tests / offline replay)
+        #   * scan.gate_bypass is True — a mechanics-test scan explicitly
+        #     says "trust these levels as-is for DEMO exercise". Running
+        #     scan_anchor against IG would only add a new failure surface
+        #     (transient IG snapshot issues, 401s, rate-limits) that
+        #     defeats the purpose of bypass. Bypass already disables
+        #     pre-trade entry gates downstream; anchor is conceptually the
+        #     same class of check and should follow the same switch.
+        #
+        # `curated_count` preserves the pre-anchor size — the number of
+        # entries the user (or swing-committee) actually curated. That's
+        # what the GATE_BYPASS_ACTIVE event's `selected_candidate_count`
+        # field is supposed to report (see models.candidate_event). The
+        # post-anchor `len(entries)` is a different number and is logged
+        # separately as "grounded candidate count".
         anchor_report = None
-        if market_data is not None and entries:
+        curated_count = len(entries)
+        if scan.gate_bypass:
+            logger.info(
+                "scan_anchor skipped: gate_bypass=True — trusting %d "
+                "curated entries without IG price grounding.",
+                curated_count,
+            )
+        elif market_data is not None and entries:
             from ..engine.scan_anchor import anchor_shortlist_to_ig
 
             anchor_report = anchor_shortlist_to_ig(
@@ -330,7 +352,7 @@ class SessionWriter:
                 len(entries),
                 pre_count,
             )
-            if not entries and not scan.gate_bypass:
+            if not entries:
                 raise RuntimeError(
                     "Scan price grounding dropped all shortlist entries. "
                     "Refusing to open a session with no candidates. "
@@ -364,7 +386,12 @@ class SessionWriter:
         self.scan_id = scan.scan_id
         self.gate_bypass = scan.gate_bypass
         self.bypass_until = scan.bypass_until
-        self.bypass_candidate_count = len(entries)
+        # `bypass_candidate_count` feeds the GATE_BYPASS_ACTIVE event's
+        # `selected_candidate_count`, which the pydantic model constrains
+        # to >= 1. Report the **curated** count (pre-anchor) per the
+        # field's documented meaning — the post-anchor count is a
+        # different concept (grounding survival) and is logged above.
+        self.bypass_candidate_count = curated_count
         self.emission_rejections = list(scan.emission_rejections or [])
         logger.info(
             "Scan ingested: scan_id=%s universe=%d shortlist=%d",

@@ -39,6 +39,7 @@ from lightstreamer.client import (
     Subscription,
     SubscriptionListener,
 )
+from ..utils.time_utils import utc_now
 
 from ..auth.ig_auth import IGSession
 from .scaling import resolve_scaling_factor
@@ -90,7 +91,7 @@ class Tick:
     pct_change: Optional[float]
     update_time_utc: Optional[str]
     scaling_factor: float
-    updated_at_utc: datetime = field(default_factory=datetime.utcnow)
+    updated_at_utc: datetime = field(default_factory=utc_now)
 
     def as_snapshot_dict(self) -> dict:
         """Return the Tick as the legacy 10-field dict shape that
@@ -476,7 +477,7 @@ class LightstreamerPriceFeed(PriceFeed):
             tick = self._tick_cache.get(epic)
         if tick is None:
             raise StalePriceError(epic=epic, age_seconds=float("inf"))
-        age = (datetime.utcnow() - tick.updated_at_utc).total_seconds()
+        age = (utc_now() - tick.updated_at_utc).total_seconds()
         if age > threshold:
             raise StalePriceError(epic=epic, age_seconds=age)
         return tick
@@ -544,7 +545,7 @@ class LightstreamerPriceFeed(PriceFeed):
             pct_change=_safe_float(get("CHANGE_PCT")),  # already %
             update_time_utc=get("UPDATE_TIME"),
             scaling_factor=scaling_factor,
-            updated_at_utc=datetime.utcnow(),
+            updated_at_utc=utc_now(),
         )
         with self._lock:
             self._tick_cache[epic] = tick

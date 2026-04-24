@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from ..config.rejection_codes import RejectCode
 from .common import Decision, Direction, EntryType, Market
+from ..utils.time_utils import utc_now
 
 
 class AuditGates(BaseModel):
@@ -60,7 +61,7 @@ class AuditUKSpecific(BaseModel):
 class AuditEntry(BaseModel):
     """Complete audit log entry — one per decision."""
 
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
     signal_id: str
     ticker: str
     market: Market

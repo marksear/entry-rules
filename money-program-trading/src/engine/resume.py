@@ -52,6 +52,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from ..utils.time_utils import utc_now
+
 from ..models.candidate_event import CandidateEvent, PositionResumedPayload
 from ..models.common import Direction, EntryType, Market
 from ..models.log_enums import (
@@ -319,7 +321,7 @@ def rehydrate_open_positions(
                     id=str(uuid4()),
                     session_id=new_session_id,
                     candidate_id=plan.candidate_id,
-                    ts_utc=datetime.utcnow(),
+                    ts_utc=utc_now(),
                     event_type=EventType.POSITION_RESUMED,
                     actor=ActorKind.EXECUTOR,
                     payload=payload,

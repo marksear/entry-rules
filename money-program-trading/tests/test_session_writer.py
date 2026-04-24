@@ -46,6 +46,7 @@ from src.models import (
     TriggerFiredPayload,
     UniverseScoreEntry,
 )
+from src.utils.time_utils import utc_now
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -727,7 +728,7 @@ def test_foreign_key_enforced(database: Database):
                 0.23,
                 0.0075,
                 "DEMO",
-                datetime.utcnow().isoformat(),
+                utc_now().isoformat(),
                 1,
             ),
         )
