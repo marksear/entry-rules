@@ -26,6 +26,7 @@ import pytest
 from src.config.settings import PriceFeedMode
 from src.data.price_feed import (
     LightstreamerPriceFeed,
+    ParallelPriceFeed,
     PriceFeed,
     RestPriceFeed,
     StalePriceError,
@@ -166,13 +167,20 @@ def test_factory_returns_ls_feed_for_lightstreamer_mode():
     assert feed_obj._degraded_seconds == 42.0
 
 
-def test_factory_rejects_parallel_until_phase_3_ships():
-    """parallel mode is documented as Phase-3-only in the spec; the
-    factory must refuse rather than silently falling back to rest."""
+def test_factory_returns_parallel_feed_for_parallel_mode():
+    """Phase 3: parallel mode returns a ParallelPriceFeed wrapping both
+    inner feeds. Validation-only per the spec; not meant for LIVE."""
     session = _fake_session()
-    cfg = SimpleNamespace(price_feed_mode=PriceFeedMode.PARALLEL)
-    with pytest.raises(NotImplementedError, match="Phase 3"):
-        build_price_feed(session, cfg)
+    cfg = SimpleNamespace(
+        price_feed_mode=PriceFeedMode.PARALLEL,
+        price_feed_stale_seconds=10.0,
+        price_feed_degraded_seconds=60.0,
+    )
+    feed_obj = build_price_feed(session, cfg)
+    assert isinstance(feed_obj, ParallelPriceFeed)
+    # Must be carrying both inner feeds, properly typed.
+    assert isinstance(feed_obj._rest, RestPriceFeed)
+    assert isinstance(feed_obj._ls, LightstreamerPriceFeed)
 
 
 def test_factory_rejects_unknown_mode():

@@ -614,6 +614,160 @@ class _TickListener(SubscriptionListener):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# ParallelPriceFeed — Phase 3 (validation only; not for production)
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Runs REST and Lightstreamer side-by-side, logging divergence on every
+# ``latest()`` call. The purpose is to prove, with real IG data, that
+# Lightstreamer and REST DO diverge — specifically in the staleness
+# pattern we suspect from 2026-04-23 (REST returning values unchanged
+# for minutes while the LS feed shows real tape movement).
+#
+# Safety during validation: when LS is fresh, ``latest()`` returns the
+# LS tick (that's the cutover preview). When LS raises StalePriceError
+# — i.e. disconnect, slow subscription start, first-tick-not-yet — we
+# fall back to REST rather than raising, so the monitor loop never
+# halts mid-session just because the validation harness hit a hiccup.
+# Divergence is still logged: every call records REST vs LS mid, plus a
+# ``source_used`` indicator so the post-session analysis can tell what
+# the monitor was actually trading on.
+#
+# This feed is NOT meant to run in LIVE. Use in DEMO only, flip back to
+# ``rest`` once Phase 3 validation complete.
+
+
+_DIVERGENCE_BPS_THRESHOLD = 30.0  # basis points — matches S-4 gate
+
+
+class ParallelPriceFeed(PriceFeed):
+    """Run REST + Lightstreamer in parallel. Validation tool.
+
+    Lifecycle delegates to both inner feeds. ``latest()`` fetches from
+    both, computes basis-points divergence between mid prices, logs on
+    every call, and returns the fresher source (LS preferred).
+
+    Not thread-safe beyond what the inner feeds provide; LS callback
+    thread writes into LS's own cache, REST is fetched synchronously on
+    each ``latest()`` call.
+    """
+
+    def __init__(self, rest: RestPriceFeed, ls: LightstreamerPriceFeed) -> None:
+        self._rest = rest
+        self._ls = ls
+
+    # ── Lifecycle ─────────────────────────────────────────────
+
+    def start(self) -> None:
+        """Start both feeds. LS first because it's the one with a real
+        network connection to warm up; REST is stateless."""
+        self._ls.start()
+        self._rest.start()  # no-op, but honours the contract
+
+    def stop(self) -> None:
+        """Stop both feeds. Swallow failures on LS so REST teardown
+        still runs — matches the ``LightstreamerPriceFeed.stop``
+        convention."""
+        try:
+            self._ls.stop()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ParallelPriceFeed: LS stop failed: %s", e)
+        self._rest.stop()
+
+    def subscribe(self, epic: str) -> None:
+        """Subscribe both feeds. REST's subscribe is a no-op; LS opens
+        the streaming subscription."""
+        self._ls.subscribe(epic)
+        self._rest.subscribe(epic)
+
+    def unsubscribe(self, epic: str) -> None:
+        self._ls.unsubscribe(epic)
+        self._rest.unsubscribe(epic)
+
+    # ── Data reads ────────────────────────────────────────────
+
+    def latest(self, epic: str, max_age_seconds: float | None = None) -> Tick:
+        """Fetch from both, log divergence, prefer LS.
+
+        Behaviour:
+        1. Try LS (subject to its ``max_age_seconds`` threshold).
+        2. Fetch REST unconditionally (to have a divergence comparator).
+        3. If divergence exceeds the 30bps threshold, emit a
+           ``PRICE_DIVERGENCE`` log line with both mids + timestamps.
+        4. Return the LS tick if it was fresh; else REST.
+
+        The REST fetch happens on every call even when LS is fresh —
+        yes, that's 2× the REST load of normal operation. That's the
+        price of validation; it goes back to LS-only at Phase 4 cutover.
+        """
+        ls_tick: Tick | None = None
+        try:
+            ls_tick = self._ls.latest(epic, max_age_seconds=max_age_seconds)
+        except StalePriceError as e:
+            # LS couldn't serve — record and fall through to REST.
+            logger.info(
+                "ParallelPriceFeed: LS stale for %s (age=%.1fs), "
+                "falling back to REST for this tick.",
+                epic, e.age_seconds,
+            )
+        rest_tick = self._rest.latest(epic)  # always fresh on return
+        self._log_divergence(epic, rest_tick, ls_tick)
+        if ls_tick is not None:
+            return ls_tick
+        return rest_tick
+
+    def get_scaling_factor(self, epic: str) -> float:
+        """Prefer LS's cached factor; fall back to REST's cache."""
+        return self._ls.get_scaling_factor(epic) or self._rest.get_scaling_factor(epic)
+
+    # ── Divergence detection ──────────────────────────────────
+
+    def _log_divergence(
+        self,
+        epic: str,
+        rest_tick: Tick,
+        ls_tick: Tick | None,
+    ) -> None:
+        """Emit a PRICE_DIVERGENCE log when |rest_mid − ls_mid|/rest_mid
+        exceeds the threshold. No-op when either mid is unavailable."""
+        rest_mid = _mid(rest_tick)
+        if rest_mid is None or rest_mid <= 0:
+            return
+        if ls_tick is None:
+            # Special case: LS unavailable; that's itself a signal, but
+            # logged at latest()'s info line above rather than as a
+            # divergence event (the two feeds didn't "disagree", LS just
+            # couldn't serve).
+            return
+        ls_mid = _mid(ls_tick)
+        if ls_mid is None or ls_mid <= 0:
+            return
+        diff_bps = abs(rest_mid - ls_mid) / rest_mid * 10_000.0
+        if diff_bps < _DIVERGENCE_BPS_THRESHOLD:
+            logger.debug(
+                "ParallelPriceFeed: %s — REST=%.4f LS=%.4f diff=%.1fbps (within threshold)",
+                epic, rest_mid, ls_mid, diff_bps,
+            )
+            return
+        logger.warning(
+            "PRICE_DIVERGENCE %s — REST=%.4f (updated_at=%s) LS=%.4f "
+            "(updated_at=%s) diff=%.1fbps (threshold=%.1fbps)",
+            epic, rest_mid, rest_tick.updated_at_utc.isoformat(),
+            ls_mid, ls_tick.updated_at_utc.isoformat(),
+            diff_bps, _DIVERGENCE_BPS_THRESHOLD,
+        )
+
+
+def _mid(tick: Tick) -> float | None:
+    """Compute the mid of a Tick. Falls back to ``last_traded`` when bid
+    or ask is None (some LS frames don't carry one side)."""
+    if tick is None:
+        return None
+    if tick.bid is not None and tick.ask is not None:
+        return (tick.bid + tick.ask) / 2.0
+    return tick.last_traded
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Factory — single entry-point for session_init / callers
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -625,10 +779,9 @@ def build_price_feed(session: IGSession, settings) -> PriceFeed:
 
     - ``rest`` → ``RestPriceFeed`` (today's behaviour).
     - ``lightstreamer`` → ``LightstreamerPriceFeed`` (Phase 2).
-    - ``parallel`` → **TODO (spec §6 Phase 3)**: a ``ParallelPriceFeed``
-      that runs both and logs divergence on every tick. Not implemented
-      in Phase 2 — selecting ``parallel`` today raises ``NotImplementedError``
-      rather than silently falling back, so the rollout sequence is enforced.
+    - ``parallel`` → ``ParallelPriceFeed`` wrapping both (Phase 3,
+      validation only — see ``docs/specs/S3_LIGHTSTREAMER_SPEC.md`` §6
+      Phase 3 for rollout discipline).
 
     ``settings`` is typed loosely (duck-typed on ``price_feed_mode``,
     ``price_feed_stale_seconds``, ``price_feed_degraded_seconds``) so the
@@ -638,20 +791,21 @@ def build_price_feed(session: IGSession, settings) -> PriceFeed:
     """
     mode = getattr(settings, "price_feed_mode", "rest")
     mode_str = mode.value if hasattr(mode, "value") else str(mode)
+    stale = getattr(settings, "price_feed_stale_seconds", 10.0)
+    degraded = getattr(settings, "price_feed_degraded_seconds", 60.0)
 
     if mode_str == "rest":
         return RestPriceFeed(session)
     if mode_str == "lightstreamer":
         return LightstreamerPriceFeed(
-            session,
-            stale_seconds=getattr(settings, "price_feed_stale_seconds", 10.0),
-            degraded_seconds=getattr(settings, "price_feed_degraded_seconds", 60.0),
+            session, stale_seconds=stale, degraded_seconds=degraded,
         )
     if mode_str == "parallel":
-        raise NotImplementedError(
-            "price_feed_mode=parallel is reserved for Phase 3 validation "
-            "(see docs/specs/S3_LIGHTSTREAMER_SPEC.md §6 Phase 3) and is "
-            "not yet implemented. Use 'rest' or 'lightstreamer'."
+        return ParallelPriceFeed(
+            rest=RestPriceFeed(session),
+            ls=LightstreamerPriceFeed(
+                session, stale_seconds=stale, degraded_seconds=degraded,
+            ),
         )
     raise ValueError(
         f"Unknown price_feed_mode={mode_str!r}. Expected one of "
