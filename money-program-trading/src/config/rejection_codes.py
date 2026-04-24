@@ -39,6 +39,12 @@ class RejectCode(str, Enum):
     R20 = "R20"  # BGU: opening range not yet formed (first 15 min)
     R21 = "R21"  # BGU: price has not broken above opening-range high
 
+    # Trigger-breakout gate (non-gap days). Livermore / Minervini pivot-
+    # point discipline: wait for the break ABOVE trigger_high (LONG) or
+    # BELOW trigger_low (SHORT). A tick inside the zone is NOT an entry.
+    # See feedback_trigger_semantics. TMUS 2026-04-24 motivates it.
+    R22 = "R22"  # Trigger zone entered; awaiting strict breakout of outer bound
+
     @property
     def description(self) -> str:
         return _DESCRIPTIONS[self]
@@ -71,6 +77,10 @@ _DESCRIPTIONS: dict[RejectCode, str] = {
     RejectCode.R19: "Early-stage gap down — possible shakeout",
     RejectCode.R20: "BGU: opening range not yet formed (first 15 min after gap-up open)",
     RejectCode.R21: "BGU: price has not broken above opening-range high",
+    RejectCode.R22: (
+        "Trigger zone entered; awaiting strict breakout above trigger_high "
+        "(LONG) or below trigger_low (SHORT)"
+    ),
 }
 
 _APPLIES_TO: dict[RejectCode, str] = {
@@ -95,4 +105,5 @@ _APPLIES_TO: dict[RejectCode, str] = {
     RejectCode.R19: "SHORT",
     RejectCode.R20: "LONG",
     RejectCode.R21: "LONG",
+    RejectCode.R22: "BOTH",
 }

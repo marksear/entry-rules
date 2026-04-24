@@ -103,10 +103,14 @@ def _snap(last: float, status: str = "TRADEABLE") -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def test_non_gap_day_fires_on_zone_crossing_as_before():
+def test_non_gap_day_gates_inside_zone_with_r22_then_fires_on_breakout():
     """A LONG candidate whose FIRST observed tick is below trigger_low is
-    not a gap-up. ``gap_up_detected`` stays False; the candidate fires
-    the moment price crosses trigger_low, with no BGU interference."""
+    not a gap-up — ``gap_up_detected`` stays False.
+
+    Under the Rule-22 breakout gate (feedback_trigger_semantics), a tick
+    INSIDE the zone is still not an entry — we require a strict break
+    above trigger_high. So a mid-zone tick must REJECT(R22), and only
+    a tick strictly above trigger_high may FIRE."""
     plan = _long_plan()
     state = CandidateRuntimeState()
     t0 = utc_now()
@@ -116,8 +120,15 @@ def test_non_gap_day_fires_on_zone_crossing_as_before():
     assert out.decision in (Decision.HOLD, Decision.ARM)
     assert state.gap_up_detected is False
 
-    # Later, price rallies into the trigger zone.
+    # Later, price rallies INTO the trigger zone [193, 196]. Before this
+    # commit this would have fired. Now: R22 — awaiting breakout above
+    # trigger_high.
     out = classify_tick(plan, _snap(last=193.5), state, now=t0 + timedelta(minutes=5))
+    assert out.decision == Decision.REJECT
+    assert out.rejection_code == "R22"
+
+    # Price strictly breaks above trigger_high=196.0 → FIRE.
+    out = classify_tick(plan, _snap(last=196.25), state, now=t0 + timedelta(minutes=8))
     assert out.decision == Decision.FIRE
 
 

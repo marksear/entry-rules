@@ -132,15 +132,29 @@ def test_blank_market_status_treated_as_tradeable():
 # ---------------------------------------------------------------------------
 
 
-def test_long_fires_when_price_at_trigger():
-    plan = _long_plan(trigger_low=100.00)
+def test_long_rejects_r22_at_trigger_low():
+    """Non-gap day, price exactly at trigger_low. Under the breakout rule
+    (feedback_trigger_semantics) a tick INSIDE the zone is not an entry —
+    we wait for the strict break above trigger_high."""
+    plan = _long_plan(trigger_low=100.00, trigger_high=100.10)
     out = classify_tick(plan, _snap(last=100.00), CandidateRuntimeState())
-    assert out.decision == Decision.FIRE
+    assert out.decision == Decision.REJECT
+    assert out.rejection_code == "R22"
     assert out.distance_pts == pytest.approx(0.0)
 
 
-def test_long_fires_when_price_above_trigger():
-    plan = _long_plan(trigger_low=100.00)
+def test_long_rejects_r22_inside_trigger_zone():
+    """Non-gap day, price inside the zone but below trigger_high. Still R22
+    — we haven't broken above the pivot."""
+    plan = _long_plan(trigger_low=100.00, trigger_high=100.10)
+    out = classify_tick(plan, _snap(last=100.05), CandidateRuntimeState())
+    assert out.decision == Decision.REJECT
+    assert out.rejection_code == "R22"
+
+
+def test_long_fires_on_strict_breakout_above_trigger_high():
+    """Non-gap day, price breaks strictly above trigger_high. FIRE."""
+    plan = _long_plan(trigger_low=100.00, trigger_high=100.10)
     out = classify_tick(plan, _snap(last=100.55), CandidateRuntimeState())
     assert out.decision == Decision.FIRE
     assert out.distance_pts == pytest.approx(0.55)
@@ -174,14 +188,29 @@ def test_long_arms_only_once():
 # ---------------------------------------------------------------------------
 
 
-def test_short_fires_when_price_at_trigger():
-    plan = _short_plan(trigger_high=75.10)
+def test_short_rejects_r22_at_trigger_high():
+    """Non-gap day SHORT, price exactly at trigger_high. Symmetric to the
+    LONG R22 rule — a tick inside the zone is not an entry, we wait for
+    the strict break BELOW trigger_low."""
+    plan = _short_plan(trigger_low=75.00, trigger_high=75.10)
     out = classify_tick(plan, _snap(last=75.10), CandidateRuntimeState())
-    assert out.decision == Decision.FIRE
+    assert out.decision == Decision.REJECT
+    assert out.rejection_code == "R22"
 
 
-def test_short_fires_when_price_below_trigger():
-    plan = _short_plan(trigger_high=75.10)
+def test_short_rejects_r22_inside_trigger_zone():
+    """Non-gap day SHORT, price inside zone but above trigger_low."""
+    plan = _short_plan(trigger_low=75.00, trigger_high=75.10)
+    out = classify_tick(plan, _snap(last=75.05), CandidateRuntimeState())
+    assert out.decision == Decision.REJECT
+    assert out.rejection_code == "R22"
+
+
+def test_short_fires_on_strict_breakdown_below_trigger_low():
+    """Non-gap day SHORT, price breaks strictly below trigger_low. FIRE.
+    distance_pts is measured from trigger_high (the favourable-side
+    bound for SHORT), so last=74.50 vs trigger_high=75.10 → 0.60."""
+    plan = _short_plan(trigger_low=75.00, trigger_high=75.10)
     out = classify_tick(plan, _snap(last=74.50), CandidateRuntimeState())
     assert out.decision == Decision.FIRE
     assert out.distance_pts == pytest.approx(0.60)

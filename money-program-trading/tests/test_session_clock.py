@@ -215,7 +215,7 @@ def test_minutes_to_session_end():
 
 
 def test_classify_tick_fires_normally_before_entries_cutoff():
-    plan = _make_plan()
+    plan = _make_plan()  # trigger_low=100.0, trigger_high=101.0
     # Pre-seed runtime state to model a non-gap day — the candidate's
     # session opened BELOW the trigger zone, so Rule 9 BGU is not
     # engaged and the test can exercise the session-cutoff path alone.
@@ -227,16 +227,18 @@ def test_classify_tick_fires_normally_before_entries_cutoff():
     clock = SessionClock.for_us_session(date(2026, 4, 17))
     now = datetime(2026, 4, 17, 17, 0, tzinfo=timezone.utc)  # well before cutoff
 
-    snap = {"last_traded": 100.25, "market_status": "TRADEABLE"}
+    # Strictly above trigger_high=101.0 so the R22 breakout gate passes
+    # and the test exercises the session-cutoff path in isolation.
+    snap = {"last_traded": 101.25, "market_status": "TRADEABLE"}
     outcome = classify_tick(plan, snap, state, session_clock=clock, now=now)
 
     assert outcome.decision == Decision.FIRE
 
 
 def test_classify_tick_rejects_with_session_cutoff_code_after_cutoff():
-    plan = _make_plan()
+    plan = _make_plan()  # trigger_low=100.0, trigger_high=101.0
     # Non-gap day (see sibling test) so the session-cutoff rejection is
-    # the thing under test, not Rule 9 BGU.
+    # the thing under test, not Rule 9 BGU or Rule 22 breakout gate.
     state = CandidateRuntimeState(
         session_open_price=95.0,
         session_open_ts_utc=datetime(2026, 4, 17, 13, 30, tzinfo=timezone.utc),
@@ -245,7 +247,9 @@ def test_classify_tick_rejects_with_session_cutoff_code_after_cutoff():
     clock = SessionClock.for_us_session(date(2026, 4, 17))
     now = datetime(2026, 4, 17, 18, 31, tzinfo=timezone.utc)  # past 18:30 cutoff
 
-    snap = {"last_traded": 100.25, "market_status": "TRADEABLE"}
+    # Above trigger_high=101.0 — the trade WOULD fire on breakout but
+    # must be rejected with R_SESSION_CUTOFF because entries are closed.
+    snap = {"last_traded": 101.25, "market_status": "TRADEABLE"}
     outcome = classify_tick(plan, snap, state, session_clock=clock, now=now)
 
     assert outcome.decision == Decision.REJECT
@@ -260,7 +264,9 @@ def test_classify_tick_rejects_short_fire_with_session_cutoff_code():
     clock = SessionClock.for_us_session(date(2026, 4, 17))
     now = datetime(2026, 4, 17, 18, 31, tzinfo=timezone.utc)
 
-    snap = {"last_traded": 99.5, "market_status": "TRADEABLE"}
+    # Strictly below trigger_low=99.0 so R22 breakout gate passes and
+    # the session-cutoff path is the thing under test.
+    snap = {"last_traded": 98.5, "market_status": "TRADEABLE"}
     outcome = classify_tick(plan, snap, state, session_clock=clock, now=now)
 
     assert outcome.decision == Decision.REJECT
@@ -290,10 +296,11 @@ def test_classify_tick_still_arms_and_holds_past_cutoff():
 
 
 def test_classify_tick_without_clock_unchanged_behaviour():
-    """Backward-compat: no clock → no cutoff enforcement."""
+    """Backward-compat: no clock → no cutoff enforcement. Price must still
+    clear trigger_high=101.0 so the R22 breakout gate passes."""
     plan = _make_plan()
     state = CandidateRuntimeState()
-    snap = {"last_traded": 100.25, "market_status": "TRADEABLE"}
+    snap = {"last_traded": 101.25, "market_status": "TRADEABLE"}
     outcome = classify_tick(plan, snap, state)  # no clock
     assert outcome.decision == Decision.FIRE
 

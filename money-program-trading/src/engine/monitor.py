@@ -257,12 +257,27 @@ def classify_tick(
     The rule in words
     -----------------
     - If no usable price / market not tradeable: ``NO_PRICE``.
-    - Long & last_price >= trigger_low: normally ``FIRE``, subject to the BGU
-      gate below.
-    - Short & last_price <= trigger_high: ``FIRE``.
     - Price within ``arm_band_pct`` of trigger on the favourable side: ``ARM``
       (if not already emitted).
     - Otherwise: ``HOLD`` (we're outside the arm band — write snapshot only).
+
+    Entry gates when price has entered the trigger zone
+    ---------------------------------------------------
+    A LONG candidate's zone is ``[trigger_low, trigger_high]``; a SHORT's is
+    the mirror. Once the last price enters the zone (``distance >= 0``), two
+    possible gates apply depending on whether the session opened as a gap-up:
+
+    - **Gap-up path (LONG only, Rule 9A):** if ``runtime.gap_up_detected``
+      (set on the first tick if the session already opened at/above
+      ``trigger_low``), the 15-min opening range is tracked and
+      ``R20`` / ``R21`` gate FIRE until price strictly breaks above the
+      opening-range high.
+    - **Non-gap path (both directions, Rule 22 breakout):** a tick INSIDE
+      the zone is NOT an entry. Livermore / Minervini pivot-point
+      discipline — FIRE requires a strict break above ``trigger_high``
+      (LONG) or below ``trigger_low`` (SHORT). Anything inside returns
+      ``REJECT(R22)``. This closes the TMUS 2026-04-24 non-gap failure
+      mode where an any-tick-in-zone rule would have bought the top.
 
     Masterclass Rule 9 BGU gate (LONG only, this PR)
     ------------------------------------------------
@@ -343,7 +358,7 @@ def classify_tick(
     )
 
     if plan.direction == Direction.LONG:
-        distance = last - plan.trigger_low  # ≥0 means fired
+        distance = last - plan.trigger_low  # ≥0 means price has entered zone
         if distance >= 0:
             # ── Rule 9A BGU gate (LONG gap-up days only) ─────────
             # Inside the 15-min window: no entry, return R20.
@@ -362,6 +377,18 @@ def classify_tick(
                         rejection_code="R21",
                         distance_pts=distance,
                     )
+            else:
+                # ── Non-gap path: strict breakout above trigger_high ─
+                # Livermore / Minervini pivot-point rule. Do NOT fire on
+                # any tick inside [trigger_low, trigger_high] — wait for
+                # the break ABOVE resistance. See feedback_trigger_semantics;
+                # TMUS 2026-04-24 non-gap path motivates this.
+                if last <= plan.trigger_high:
+                    return TickOutcome(
+                        decision=Decision.REJECT,
+                        rejection_code="R22",
+                        distance_pts=distance,
+                    )
             if entries_cutoff_hit:
                 return TickOutcome(
                     decision=Decision.REJECT,
@@ -375,8 +402,19 @@ def classify_tick(
             return TickOutcome(decision=Decision.ARM, distance_pts=distance)
         return TickOutcome(decision=Decision.HOLD, distance_pts=distance)
     else:  # SHORT
-        distance = plan.trigger_high - last  # ≥0 means fired
+        distance = plan.trigger_high - last  # ≥0 means price has entered zone
         if distance >= 0:
+            # ── Non-gap-down path: strict breakout below trigger_low ─
+            # Symmetric to the LONG trigger-breakout gate. Rule 10 (gap-
+            # down mirror of BGU) is deferred; for now SHORTs get only
+            # the strict-breakout discipline. A tick inside the zone on
+            # the right side (last >= trigger_low) is NOT an entry.
+            if last >= plan.trigger_low:
+                return TickOutcome(
+                    decision=Decision.REJECT,
+                    rejection_code="R22",
+                    distance_pts=distance,
+                )
             if entries_cutoff_hit:
                 return TickOutcome(
                     decision=Decision.REJECT,
