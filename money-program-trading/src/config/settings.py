@@ -19,6 +19,27 @@ class AccType(str, Enum):
     LIVE = "LIVE"
 
 
+class PriceFeedMode(str, Enum):
+    """Price-feed source selector for the monitor loop.
+
+    See ``docs/specs/S3_LIGHTSTREAMER_SPEC.md`` §5.
+
+    - ``REST`` — today's behaviour (default). Polls IG's
+      ``/markets/{epic}`` REST endpoint on every tick via ``RestPriceFeed``.
+      Zero-risk fallback; the REST cache staleness bug that cost £50 on
+      2026-04-23 lives here.
+    - ``LIGHTSTREAMER`` — push-based feed via IG's Lightstreamer server
+      (``LightstreamerPriceFeed``). The target post-migration state.
+    - ``PARALLEL`` — runs both and logs divergence on every tick. Debug
+      mode only; not for production. Used during spec §6 Phase 3 to prove
+      LS disagrees with REST exactly in the staleness pattern we expect.
+    """
+
+    REST = "rest"
+    LIGHTSTREAMER = "lightstreamer"
+    PARALLEL = "parallel"
+
+
 class Settings(BaseSettings):
     """All configuration flows through this single class."""
 
@@ -157,6 +178,34 @@ class Settings(BaseSettings):
     timestop_sessions: int = Field(
         default=3,
         description="Max trading sessions a position may remain open before timestop.",
+    )
+
+    # ── Price Feed (S-3 Lightstreamer migration) ─────────────────
+    # See docs/specs/S3_LIGHTSTREAMER_SPEC.md §5 + §7.2.
+    # Default stays REST through Phases 1–3; only flip to LIGHTSTREAMER
+    # after PARALLEL-mode validation confirms LS disagrees with REST
+    # exactly in the staleness pattern we expect.
+    price_feed_mode: PriceFeedMode = Field(
+        default=PriceFeedMode.REST,
+        description="rest|lightstreamer|parallel — see PriceFeedMode enum.",
+    )
+    price_feed_stale_seconds: float = Field(
+        default=10.0,
+        description=(
+            "Per-epic tick staleness threshold (seconds). "
+            "LightstreamerPriceFeed.latest() raises StalePriceError when the "
+            "last tick is older than this. Short glitches 10-60s are "
+            "tolerated; see degraded_seconds for the hard cut-off."
+        ),
+    )
+    price_feed_degraded_seconds: float = Field(
+        default=60.0,
+        description=(
+            "Feed-level degradation threshold (seconds). When staleness on an "
+            "epic exceeds this AND the epic has an open position, the monitor "
+            "force-closes via broker REST (independent of the stale LS feed). "
+            "'If we can't see prices, we don't hold positions.'"
+        ),
     )
 
     model_config = {

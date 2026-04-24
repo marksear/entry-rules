@@ -1,24 +1,26 @@
 """
-Price feed abstraction — Phase 1 of the S-3 Lightstreamer migration.
+Price feed abstraction — S-3 Lightstreamer migration (Phases 1 + 2).
 
 See ``docs/specs/S3_LIGHTSTREAMER_SPEC.md`` for the full plan. This module
 introduces a ``PriceFeed`` ABC so ``MarketData`` can read live prices from
-either the current REST polling path (``RestPriceFeed``) or a future
-Lightstreamer streaming path (``LightstreamerPriceFeed``, Phase 2) without
-changing its own call sites.
+either the current REST polling path (``RestPriceFeed``) or the
+Lightstreamer streaming path (``LightstreamerPriceFeed``).
 
-**Phase 1 is zero-behaviour-change.** ``RestPriceFeed`` calls exactly the
-same IG endpoint (``fetch_market_by_epic``) and applies exactly the same
-scaling heuristic as the inline logic that previously lived in
-``MarketData.get_market_snapshot``. ``StalePriceError`` is part of the
-interface but ``RestPriceFeed`` cannot raise it (a fresh REST fetch is
-by definition not stale at return time) — that semantic activates in
-Phase 2 when ``LightstreamerPriceFeed`` reads cached ticks.
+**Phase 1 (shipped):** ``PriceFeed`` ABC + ``Tick`` + ``RestPriceFeed``.
+Zero behaviour change — REST wrapper is a verbatim copy of the inline
+logic that used to live in ``MarketData.get_market_snapshot``.
+
+**Phase 2 (this file):** ``LightstreamerPriceFeed`` + ``build_price_feed``
+factory. Gated behind ``Settings.price_feed_mode`` env flag — default
+stays ``rest`` until PARALLEL validation in Phase 3 proves LS agrees
+with REST on fresh ticks (and disagrees exactly in the staleness pattern
+we expect).
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -26,6 +28,17 @@ from typing import Optional
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 from trading_ig.rest import IGException
+# Lightstreamer client bindings. Imported at module level so
+# ``unittest.mock.patch("src.data.price_feed.LightstreamerClient")`` in
+# tests substitutes the mock cleanly (patching only works on names
+# visible in the target module's namespace). The library ships with
+# trading-ig's full install so we can rely on it being present even on
+# REST-only hosts.
+from lightstreamer.client import (
+    LightstreamerClient,
+    Subscription,
+    SubscriptionListener,
+)
 
 from ..auth.ig_auth import IGSession
 from .scaling import resolve_scaling_factor
@@ -257,4 +270,390 @@ def _empty_tick(epic: str) -> Tick:
         pct_change=None,
         update_time_utc=None,
         scaling_factor=1.0,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# LightstreamerPriceFeed — Phase 2
+# ─────────────────────────────────────────────────────────────────────────
+#
+# IG's Lightstreamer server pushes MARKET updates over a long-lived
+# connection. Flow:
+#
+#   1. ``start()`` — reads CST/X-SECURITY-TOKEN from the existing
+#      ``IGSession.service.session.headers`` (no second REST auth —
+#      that would trip DEMO rate-limits; see
+#      ``feedback_ig_switch_account_race``), reads ``lightstreamerEndpoint``
+#      via ``ig_service.read_session(fetch_session_tokens="true")``, and
+#      connects a ``LightstreamerClient``.
+#   2. ``subscribe(epic)`` — one-time REST ``fetch_market_by_epic`` to
+#      cache the ``instrument`` metadata (for the scalingFactor fallback
+#      on first tick), then creates a MARKET:{epic} subscription with
+#      a listener that writes ticks into our in-memory cache.
+#   3. ``latest(epic, max_age)`` — looks up the cached tick; raises
+#      ``StalePriceError`` when the tick is older than ``max_age`` or
+#      absent entirely.
+#   4. ``stop()`` — unsubscribes everything and disconnects.
+#
+# LS callbacks fire on the client's own thread. Cache reads/writes go
+# through ``self._lock`` (a ``threading.Lock``).
+#
+# Imports are at module level so tests can patch ``LightstreamerClient`` /
+# ``Subscription`` via ``unittest.mock.patch``. The import is lazy in the
+# sense that ``RestPriceFeed`` doesn't touch any LS symbol — so code paths
+# that stay on REST-mode don't incur the LS library import cost.
+
+
+def _safe_float(v):
+    """Coerce to float if possible, else None. Matches the inline ``_f``
+    helper used in ``RestPriceFeed.latest``."""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+# Fields we subscribe to on each MARKET:{epic} item. Order must match
+# what IG's Lightstreamer server documents for equity MARKET subscriptions.
+# Reference: https://labs.ig.com/streaming-api-reference
+_LS_MARKET_FIELDS = [
+    "BID",
+    "OFFER",
+    "HIGH",
+    "LOW",
+    "UPDATE_TIME",
+    "MARKET_STATE",
+    "CHANGE",
+    "CHANGE_PCT",
+]
+
+
+class LightstreamerPriceFeed(PriceFeed):
+    """Streaming price feed via IG's Lightstreamer server.
+
+    Phase 2 of the S-3 migration. Default-off — only active when
+    ``Settings.price_feed_mode == PriceFeedMode.LIGHTSTREAMER``.
+
+    **Staleness contract:** ``latest(epic, max_age_seconds=None)`` raises
+    ``StalePriceError`` when the most recent tick for ``epic`` is older
+    than ``max_age_seconds`` (default: the feed's configured
+    ``stale_seconds``, typically 10s). Escalation at 60s to
+    ``PRICE_FEED_DEGRADED`` is the monitor loop's responsibility, not the
+    feed's — see spec §7.2 and (future) ``monitor.py`` wiring.
+
+    **Thread safety:** LS callbacks fire on the client's internal thread.
+    ``_tick_cache`` writes and ``latest`` reads both acquire ``_lock``.
+    """
+
+    def __init__(
+        self,
+        session: IGSession,
+        stale_seconds: float = 10.0,
+        degraded_seconds: float = 60.0,
+    ) -> None:
+        self._session = session
+        self._stale_seconds = stale_seconds
+        self._degraded_seconds = degraded_seconds
+        self._scale_cache: dict[str, float] = {}
+        self._instrument_cache: dict[str, dict] = {}
+        self._tick_cache: dict[str, Tick] = {}
+        self._subscriptions: dict[str, object] = {}
+        self._lock = threading.Lock()
+        self._ls_client: object | None = None
+        self._started = False
+
+    # ── Lifecycle ─────────────────────────────────────────────
+
+    def start(self) -> None:
+        """Open the Lightstreamer connection using the existing IG
+        session's CST/XST tokens. No second REST authentication."""
+        if self._started:
+            logger.debug("LightstreamerPriceFeed.start() — already started")
+            return
+
+        service = self._session.service  # raises if not connected
+        headers = service.session.headers
+        cst = headers.get("CST")
+        xst = headers.get("X-SECURITY-TOKEN")
+        if not cst or not xst:
+            raise RuntimeError(
+                "LightstreamerPriceFeed.start: IG session has no CST / "
+                "X-SECURITY-TOKEN headers — call IGSession.connect() first."
+            )
+
+        # Fetch lightstreamerEndpoint from the existing session. This is
+        # a lightweight GET on /session (no re-authentication).
+        endpoint = _read_lightstreamer_endpoint(service)
+        if not endpoint:
+            raise RuntimeError(
+                "LightstreamerPriceFeed.start: could not resolve "
+                "lightstreamerEndpoint from the existing IG session."
+            )
+
+        account_id = self._session.account_id or ""
+        client = LightstreamerClient(endpoint, None)
+        client.connectionDetails.setUser(account_id)
+        client.connectionDetails.setPassword(f"CST-{cst}|XST-{xst}")
+        client.connect()
+
+        self._ls_client = client
+        self._started = True
+        logger.info(
+            "LightstreamerPriceFeed started (endpoint=%s, account=%s)",
+            endpoint, account_id,
+        )
+
+    def stop(self) -> None:
+        """Unsubscribe all + disconnect. Idempotent."""
+        if not self._started:
+            return
+        # Copy keys because _unsubscribe_internal mutates the dict.
+        for epic in list(self._subscriptions.keys()):
+            try:
+                self._unsubscribe_internal(epic)
+            except Exception as e:
+                logger.warning("LS unsubscribe(%s) failed: %s", epic, e)
+        try:
+            if self._ls_client is not None:
+                self._ls_client.disconnect()
+        except Exception as e:
+            logger.warning("LS disconnect failed: %s", e)
+        self._ls_client = None
+        self._started = False
+        logger.info("LightstreamerPriceFeed stopped.")
+
+    # ── Subscription management ───────────────────────────────
+
+    def subscribe(self, epic: str) -> None:
+        """Open a MARKET:{epic} subscription. Pre-loads instrument
+        metadata (for scalingFactor) via one REST fetch_market_by_epic."""
+        if not self._started:
+            raise RuntimeError(
+                "LightstreamerPriceFeed.subscribe: call start() before "
+                "subscribing to any epic."
+            )
+        if epic in self._subscriptions:
+            logger.debug("LS subscribe(%s) — already subscribed", epic)
+            return
+
+        self._preload_instrument_metadata(epic)
+
+        sub = Subscription(
+            mode="MERGE",
+            items=[f"MARKET:{epic}"],
+            fields=_LS_MARKET_FIELDS,
+        )
+        sub.addListener(_TickListener(feed=self, epic=epic))
+        self._ls_client.subscribe(sub)
+        self._subscriptions[epic] = sub
+        logger.info("LS subscribed: MARKET:%s", epic)
+
+    def unsubscribe(self, epic: str) -> None:
+        """Close the subscription for ``epic``. Idempotent."""
+        self._unsubscribe_internal(epic)
+
+    def _unsubscribe_internal(self, epic: str) -> None:
+        sub = self._subscriptions.pop(epic, None)
+        if sub is None or self._ls_client is None:
+            return
+        self._ls_client.unsubscribe(sub)
+        logger.info("LS unsubscribed: MARKET:%s", epic)
+
+    # ── Data reads ────────────────────────────────────────────
+
+    def latest(self, epic: str, max_age_seconds: float | None = None) -> Tick:
+        """Return the most recent tick for ``epic`` or raise
+        ``StalePriceError``.
+
+        ``max_age_seconds=None`` (the default) uses the feed's configured
+        ``stale_seconds``. Callers — e.g. the monitor loop — can override
+        per-call if they know a specific epic should tolerate longer gaps.
+        """
+        threshold = self._stale_seconds if max_age_seconds is None else max_age_seconds
+        with self._lock:
+            tick = self._tick_cache.get(epic)
+        if tick is None:
+            raise StalePriceError(epic=epic, age_seconds=float("inf"))
+        age = (datetime.utcnow() - tick.updated_at_utc).total_seconds()
+        if age > threshold:
+            raise StalePriceError(epic=epic, age_seconds=age)
+        return tick
+
+    def get_scaling_factor(self, epic: str) -> float:  # noqa: D401
+        """Return the cached scaling factor for ``epic``, or 1.0."""
+        return self._scale_cache.get(epic, 1.0)
+
+    # ── Internal helpers ──────────────────────────────────────
+
+    def _preload_instrument_metadata(self, epic: str) -> None:
+        """One-time REST call to cache the ``instrument`` block so the
+        first incoming LS tick can resolve scalingFactor without another
+        network round-trip. Ignores errors — the scaling fallback
+        heuristic works on bid/ask alone if instrument is empty."""
+        if epic in self._instrument_cache:
+            return
+        try:
+            result = self._session.service.fetch_market_by_epic(epic)
+            if hasattr(result, "model_dump"):
+                result = result.model_dump()
+            if isinstance(result, dict):
+                self._instrument_cache[epic] = result.get("instrument") or {}
+            else:
+                self._instrument_cache[epic] = {}
+        except Exception as e:
+            logger.warning(
+                "LS preload instrument metadata for %s failed: %s — "
+                "scalingFactor will fall back to the bid/ask heuristic.",
+                epic, e,
+            )
+            self._instrument_cache[epic] = {}
+
+    def _on_tick(self, epic: str, item_update: object) -> None:
+        """Called (on the LS thread) for each incoming MARKET update.
+        Parses the fields into a ``Tick`` and publishes into the cache."""
+        get = item_update.getValue  # bound lookup
+        bid_raw = _safe_float(get("BID"))
+        ask_raw = _safe_float(get("OFFER"))
+        instrument = self._instrument_cache.get(epic) or {}
+        scaling_factor = resolve_scaling_factor(
+            epic, instrument, bid_raw, ask_raw,
+        )
+        self._scale_cache[epic] = scaling_factor
+
+        # LS doesn't send a last-traded field on MARKET subscriptions — use
+        # mid as the fallback, same convention as RestPriceFeed when IG
+        # omits lastTraded.
+        last_traded_raw = None
+        if bid_raw is not None and ask_raw is not None:
+            last_traded_raw = (bid_raw + ask_raw) / 2.0
+
+        def _scale(v):
+            return None if v is None else v / scaling_factor
+
+        tick = Tick(
+            epic=epic,
+            bid=_scale(bid_raw),
+            ask=_scale(ask_raw),
+            last_traded=_scale(last_traded_raw),
+            market_status=get("MARKET_STATE"),
+            high=_scale(_safe_float(get("HIGH"))),
+            low=_scale(_safe_float(get("LOW"))),
+            net_change=_scale(_safe_float(get("CHANGE"))),
+            pct_change=_safe_float(get("CHANGE_PCT")),  # already %
+            update_time_utc=get("UPDATE_TIME"),
+            scaling_factor=scaling_factor,
+            updated_at_utc=datetime.utcnow(),
+        )
+        with self._lock:
+            self._tick_cache[epic] = tick
+
+
+def _read_lightstreamer_endpoint(service) -> str | None:
+    """Extract ``lightstreamerEndpoint`` from the existing IG session.
+
+    ``trading_ig.IGService.read_session(fetch_session_tokens="true")`` is
+    a lightweight GET that returns the same session metadata IG sent at
+    authentication time, including the Lightstreamer endpoint URL. This
+    avoids calling ``create_session`` a second time (which would be a
+    fresh auth and trip DEMO's rate-limit).
+    """
+    try:
+        info = service.read_session(fetch_session_tokens="true")
+    except Exception as e:
+        logger.error("read_session() failed — cannot resolve LS endpoint: %s", e)
+        return None
+    if hasattr(info, "model_dump"):
+        info = info.model_dump()
+    if not isinstance(info, dict):
+        return None
+    return info.get("lightstreamerEndpoint")
+
+
+class _TickListener(SubscriptionListener):
+    """A ``SubscriptionListener`` for one MARKET:{epic} item.
+
+    Tests can skip the LS client entirely and just call
+    ``_feed._on_tick(epic, item_update)`` directly — the listener is a
+    thin adapter between LS callbacks and our pure-Python ``_on_tick``
+    method.
+    """
+
+    def __init__(self, feed: LightstreamerPriceFeed, epic: str) -> None:
+        super().__init__()
+        self._feed = feed
+        self._epic = epic
+
+    def onItemUpdate(self, item_update) -> None:  # noqa: N802 (LS API)
+        try:
+            self._feed._on_tick(self._epic, item_update)
+        except Exception as e:
+            logger.warning(
+                "LS tick listener error for %s: %s: %s",
+                self._epic, type(e).__name__, e,
+            )
+
+    def onSubscription(self) -> None:  # noqa: N802 (LS API)
+        logger.debug("LS onSubscription: MARKET:%s", self._epic)
+
+    def onUnsubscription(self) -> None:  # noqa: N802 (LS API)
+        logger.debug("LS onUnsubscription: MARKET:%s", self._epic)
+
+    def onSubscriptionError(self, code, message) -> None:  # noqa: N802
+        logger.error(
+            "LS subscription error for MARKET:%s — [%s] %s",
+            self._epic, code, message,
+        )
+
+    def onItemLostUpdates(self, item_name, lost_updates) -> None:  # noqa: N802
+        logger.warning(
+            "LS lost %s updates on %s — tick cache may be behind briefly.",
+            lost_updates, item_name,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Factory — single entry-point for session_init / callers
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def build_price_feed(session: IGSession, settings) -> PriceFeed:
+    """Construct the configured ``PriceFeed`` implementation.
+
+    Reads ``settings.price_feed_mode`` and dispatches:
+
+    - ``rest`` → ``RestPriceFeed`` (today's behaviour).
+    - ``lightstreamer`` → ``LightstreamerPriceFeed`` (Phase 2).
+    - ``parallel`` → **TODO (spec §6 Phase 3)**: a ``ParallelPriceFeed``
+      that runs both and logs divergence on every tick. Not implemented
+      in Phase 2 — selecting ``parallel`` today raises ``NotImplementedError``
+      rather than silently falling back, so the rollout sequence is enforced.
+
+    ``settings`` is typed loosely (duck-typed on ``price_feed_mode``,
+    ``price_feed_stale_seconds``, ``price_feed_degraded_seconds``) so the
+    factory stays importable without a hard dep on pydantic-settings —
+    useful for unit tests that construct fake settings via
+    ``types.SimpleNamespace``.
+    """
+    mode = getattr(settings, "price_feed_mode", "rest")
+    mode_str = mode.value if hasattr(mode, "value") else str(mode)
+
+    if mode_str == "rest":
+        return RestPriceFeed(session)
+    if mode_str == "lightstreamer":
+        return LightstreamerPriceFeed(
+            session,
+            stale_seconds=getattr(settings, "price_feed_stale_seconds", 10.0),
+            degraded_seconds=getattr(settings, "price_feed_degraded_seconds", 60.0),
+        )
+    if mode_str == "parallel":
+        raise NotImplementedError(
+            "price_feed_mode=parallel is reserved for Phase 3 validation "
+            "(see docs/specs/S3_LIGHTSTREAMER_SPEC.md §6 Phase 3) and is "
+            "not yet implemented. Use 'rest' or 'lightstreamer'."
+        )
+    raise ValueError(
+        f"Unknown price_feed_mode={mode_str!r}. Expected one of "
+        "'rest' | 'lightstreamer' | 'parallel'."
     )

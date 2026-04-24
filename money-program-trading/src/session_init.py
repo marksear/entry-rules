@@ -38,6 +38,7 @@ from uuid import uuid4
 from .auth.ig_auth import IGSession
 from .config.settings import get_settings
 from .data.market_data import MarketData
+from .data.price_feed import PriceFeed, build_price_feed
 from .engine.broker import Broker
 from .engine.monitor import CandidatePlan, MonitorLoop
 from .engine.resume import fetch_live_positions, rehydrate_open_positions
@@ -304,7 +305,18 @@ def run(args: argparse.Namespace) -> int:
     # we refuse to open a session we couldn't actually monitor.
     ig_session = IGSession(settings)
     ig_session.connect()
-    market_data = MarketData(ig_session)
+
+    # S-3 Phase 2: construct the configured price feed. Defaults to
+    # ``RestPriceFeed`` (today's behaviour) unless PRICE_FEED_MODE is set
+    # in the env to ``lightstreamer``. See docs/specs/S3_LIGHTSTREAMER_SPEC.md.
+    #
+    # ``start()`` is a no-op for REST and a Lightstreamer ``connect()`` for
+    # the streaming feed. Any exception at start aborts the session before
+    # we touch the DB — same discipline as the ``ig_session.connect()``
+    # failure path above.
+    price_feed: PriceFeed = build_price_feed(ig_session, settings)
+    price_feed.start()
+    market_data = MarketData(ig_session, price_feed=price_feed)
 
     session_id_for_journal: str | None = None
     try:
@@ -459,6 +471,14 @@ def run(args: argparse.Namespace) -> int:
                 logger.exception("Failed to write session journal: %s", e)
             return 0
     finally:
+        # Stop the price feed FIRST so LS unsubscribes/disconnects while
+        # the IG session is still alive (LS uses IG's CST/XST for auth).
+        # Swallow feed-stop exceptions — we must still disconnect the IG
+        # session to leave IG's server state clean.
+        try:
+            price_feed.stop()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("price_feed.stop() raised: %s", e)
         ig_session.disconnect()
 
 
