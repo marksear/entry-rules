@@ -156,8 +156,9 @@ candidates that would push it over the cap are deferred.
 - **Applies to:** BOTH
 - **Where:** entry-rules `executor.py` pre-fire check (book-level, not
   candidate-level)
-- **Code status:** ⏳ NEEDS VERIFICATION. The executor likely tracks
-  this; needs an explicit assertion.
+- **Code status:** **DROPPED** for current profile (Mark 2026-04-27).
+  Top-3 trades/day × 1% per trade = 3% maximum open risk — never binds
+  the 6% cap. Re-enable if N rises above 6.
 
 ### Rule R6 — Short exposure cap ≤ 50%
 
@@ -165,7 +166,8 @@ Combined notional of all SHORT positions ≤ 50% of portfolio.
 
 - **Applies to:** SHORT
 - **Where:** entry-rules executor pre-fire
-- **Code status:** ⏳ NEEDS VERIFICATION.
+- **Code status:** **DEFERRED** until SHORT trading returns
+  (Mark 2026-04-27). Currently LONG-biased.
 
 ---
 
@@ -234,9 +236,12 @@ session check: if projected volume < threshold → reduce to 50% pilot.
 End of day: if volume still < threshold → close pilot.
 
 - **Applies to:** BOTH
-- **Code status:** ✗ NOT ENFORCED at entry time. Daily scanner uses
-  this for screening, but per-tick volume confirmation isn't in
-  classify_tick. Needs intraday volume data.
+- **Code status:** **DROPPED** for the small-account intraday-managed
+  profile (Mark 2026-04-27). Per-tick volume confirmation requires an
+  intraday volume feed we don't fetch, and the value-at-risk reduction
+  is small for an intraday-only hold (15:55 ET hard-close caps overnight
+  exposure to zero anyway). Re-enable if intraday volume becomes
+  available or if hold-overnight returns.
 
 ### Rule 6 — Holy Grail / EMA Pullback (L-B / S-B)
 
@@ -244,10 +249,9 @@ L-B entry: buy-stop above the high of the candle that touched the
 rising 10/20 EMA on declining volume. S-B mirror.
 
 - **Applies to:** L-B / S-B entry types
-- **Code status:** ✗ NOT ENFORCED — distinct from Rule 4 / Rule 22.
-  Today the entry shape is L-A-style (zone breakout). Per
-  `project_demo_2026-04-27` the LLM tags L-B as a setup_type but
-  classify_tick doesn't differentiate.
+- **Code status:** **DROPPED** for current profile (Mark 2026-04-27).
+  Universe today is L-A pivot-breakout setups exclusively. If scans
+  start producing L-B / S-B entries, re-enable.
 
 ### Rule 9A — Buyable Gap Up, 15-min OR (LONG)
 
@@ -286,7 +290,8 @@ or limit at VWAP. Early-stage gap down = possible shakeout = DO NOT
 SHORT.
 
 - **Applies to:** SHORT
-- **Code status:** ✗ NOT ENFORCED — Rule 9A's mirror not yet built.
+- **Code status:** **DEFERRED** until SHORT trading returns
+  (Mark 2026-04-27). Track alongside R6 / Rule 9-Late.
 
 ### Rule 22 — Strict trigger breakout (non-gap days)
 
@@ -339,7 +344,9 @@ Auto-exit / cover EOD before any earnings report. No exceptions.
 ≥ 3 open positions in the same sector → reduce each new entry to 75%
 of normal size.
 
-- **Code status:** ✗ NOT ENFORCED.
+- **Code status:** **DROPPED** for current profile (Mark 2026-04-27).
+  Top-3 trades/day × even distribution makes it unlikely to hit 3 same-
+  sector. Re-enable if N rises and concentration becomes a real risk.
 
 ---
 
@@ -410,26 +417,26 @@ Failed gap → 3-day window to reclaim, then quarantine for 10 days.
 | R2 R:R 3:1 | BOTH | scanEmission | ✗ |
 | R3 Stop ≤ 8% | BOTH | scanEmission | ✗ |
 | R4 Position cap | BOTH | scanEmission/exec | ✗ |
-| R5 Total risk 6% | BOTH | executor | ⏳ |
-| R6 Short cap 50% | SHORT | executor | ⏳ |
+| R5 Total risk 6% | BOTH | executor | **DROPPED** (top-3 × 1% never binds 6%) |
+| R6 Short cap 50% | SHORT | executor | **DEFERRED** (SHORT off) |
 | S1 Market tradeable | BOTH | classify_tick | ✓ |
 | S2 Price available | BOTH | classify_tick | ✓ |
 | S3 Entries open | BOTH | classify_tick | ✓ |
 | S4 Entries cutoff | BOTH | classify_tick | ✓ |
 | 4 Pivot Buy | L-A/S-A | classify_tick (Rule 22) | ✓ |
 | 4-Chase | BOTH | classify_tick | ✗ |
-| 5 Volume Confirm | BOTH | classify_tick | ✗ |
-| 6 EMA Pullback | L-B/S-B | classify_tick | ✗ |
+| 5 Volume Confirm | BOTH | classify_tick | **DROPPED** (intraday-only profile) |
+| 6 EMA Pullback | L-B/S-B | classify_tick | **DROPPED** (L-A only universe) |
 | 9A BGU 15-min OR | LONG | classify_tick | ✓ |
 | 9B BGU VWAP | LONG | classify_tick | ✗ |
 | 9-Late | LONG | classify_tick | ✗ |
-| 10 SGD | SHORT | classify_tick | ✗ |
+| 10 SGD | SHORT | classify_tick | **DEFERRED** (SHORT off) |
 | 22 Strict breakout | BOTH | classify_tick | ✓ |
 | X1 Budget capacity | BOTH | executor | ⏳ |
 | X2 Position cap | BOTH | executor | ⏳ |
-| X3 UK spread | UK | executor | ⏳ |
+| X3 UK spread | UK | executor | ⏳ ACTIVE (Mark 2026-04-28 trading UK) — display ✓, executor wiring needed |
 | X4 Earnings blackout | BOTH | scanEmission/exec | ⏳ off |
-| X5 Sector correlation | BOTH | executor | ✗ |
+| X5 Sector correlation | BOTH | executor | **DROPPED** (rare bind at N=3) |
 | 7 Scaling | BOTH | executor | OFF (design) |
 | 8 Order Types | BOTH | executor | ✓ |
 | 11 Overnight | BOTH | exit | ⏳ |

@@ -695,8 +695,13 @@ def main() -> None:
             epics[plan.candidate_id] = None
 
     today = date.today()
-    # All current shortlists are US-session; UK switch is a one-line change.
-    clock = SessionClock.for_us_session(today)
+    # Build a session clock per market — a scan can mix US + UK candidates and
+    # each gets its OWN entries-open / cutoff bounds. Picked by plan.market
+    # in the polling loop below.
+    clocks_by_market = {
+        Market.US: SessionClock.for_us_session(today),
+        Market.UK: SessionClock.for_uk_session(today),
+    }
 
     print(
         f"\nMonitoring {len(plans)} candidate"
@@ -717,12 +722,21 @@ def main() -> None:
         scan_entry = entries_by_id.get(p.candidate_id, {})
         print(format_preflight(scan_entry, p))
 
+    # Print session bounds for whichever markets the candidates use.
+    markets_in_play = sorted({p.market for p in plans}, key=lambda m: m.value)
+    print()
+    for mkt in markets_in_play:
+        c = clocks_by_market[mkt]
+        print(
+            f"{mkt.value} session: entries open at {c.entries_open_utc.isoformat()} "
+            f"({fmt_local_time(c.entries_open_utc)} BST), "
+            f"hard close at {c.hard_close_utc.isoformat()} "
+            f"({fmt_local_time(c.hard_close_utc)} BST)"
+        )
     print(
-        f"\nSession entries open at {clock.entries_open_utc.isoformat()}"
-        f"\nSession hard close   at {clock.hard_close_utc.isoformat()}"
-        f"\n\nPolling IG every {POLL_SECONDS}s. Ctrl+C to stop."
+        f"\nPolling IG every {POLL_SECONDS}s. Ctrl+C to stop."
         f"\nThis tool NEVER places orders. You hit buy/sell yourself when FIRE shows."
-        f"\nRules in force: Rule 9A BGU + Rule 22 strict breakout + session-clock gates."
+        f"\nRules in force: see docs/specs/CANONICAL_ENTRY_RULES.md."
         f"\n"
     )
 
@@ -735,6 +749,7 @@ def main() -> None:
             ts_et = now_utc.astimezone(NY_TZ).strftime("%H:%M ET")
             print(f"\n=== {ts_utc}  ({ts_bst}  /  {ts_et}) ===\n")
             for plan in plans:
+                clock = clocks_by_market[plan.market]
                 epic = epics.get(plan.candidate_id)
                 if not epic:
                     print(
