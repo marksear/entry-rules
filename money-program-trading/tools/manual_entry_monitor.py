@@ -3,9 +3,10 @@
 manual_entry_monitor.py — heads-up display for manual trade entry.
 
 Reads a ``scan_YYYYMMDD.json`` (the same handoff entry-rules consumes),
-polls Yahoo every 60 seconds for live prices, runs the FULL Masterclass
-rule stack against each shortlist symbol, and prints whether a manual
-entry is permitted right now.
+polls **IG** every 60 seconds for live prices via the same MarketData
+adapter the live monitor uses, runs the FULL Masterclass rule stack
+against each shortlist symbol, and prints whether a manual entry is
+permitted right now.
 
 What rules run
 --------------
@@ -21,16 +22,22 @@ exact same logic that gates the live engine gates this tool. That means:
 
 Per ``feedback_trigger_semantics``: the legacy "any tick in zone fires"
 semantic is GARBAGE. This tool NEVER falls back to it. The Masterclass
-document is the law — every entry decision in this script goes through
-``classify_tick`` and respects every gate.
+document is the law.
+
+Why IG and not Yahoo
+--------------------
+The live monitor reads prices from IG. If this tool used Yahoo,
+"FIRE" might fire at a moment when IG's quote hasn't yet broken the
+trigger — and the human would enter at a different price than the
+heads-up display suggested. By pulling from IG via the same
+``MarketData`` adapter, the price the tool sees is the price the
+operator will be filled at.
 
 What this tool does NOT do
 --------------------------
 - Place orders. When a signal goes FIRE, you hit buy/sell in IG yourself.
-- Manage exits. The print-out gives you stop + target levels — set them
+- Manage exits. The print-out gives stop + target levels — set them
   manually in the broker after entry.
-- Pay attention to position sizing. The scan JSON already has stake
-  computed; copy it into IG.
 
 Usage
 -----
@@ -39,7 +46,8 @@ Usage
     python tools/manual_entry_monitor.py [path/to/scan.json]
 
 If no path is given, the most recent ``scan_*.json`` in
-``data/scans/`` is picked automatically.
+``data/scans/`` is picked automatically. IG credentials are read from
+``.env`` exactly as the live monitor does.
 
 Press Ctrl+C to stop.
 """
@@ -52,14 +60,13 @@ import time
 from datetime import date
 from pathlib import Path
 
-import urllib.error
-import urllib.request
-
 # Make ``src`` importable when run as ``python tools/manual_entry_monitor.py``.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from src.auth.ig_auth import IGSession  # noqa: E402
+from src.data.market_data import MarketData  # noqa: E402
 from src.engine.monitor import (  # noqa: E402
     CandidatePlan,
     CandidateRuntimeState,
@@ -73,7 +80,6 @@ from src.utils.time_utils import utc_now  # noqa: E402
 
 
 POLL_SECONDS = 60
-YAHOO_TIMEOUT = 10
 
 
 # ---------------------------------------------------------------------------
@@ -107,51 +113,11 @@ def make_plan(entry: dict, scan_id: str) -> CandidatePlan:
         target_price=(
             float(entry["target_price"]) if entry.get("target_price") is not None else None
         ),
-        ig_epic=f"manual-{entry['symbol']}",
+        ig_epic=f"manual-{entry['symbol']}",  # overwritten on resolution below
         broker_mode=BrokerMode.DEMO,
         planned_stake_gbp_per_pt=float(entry.get("planned_stake_gbp_per_pt") or 1.0),
         planned_risk_gbp=float(entry.get("planned_risk_gbp") or 50.0),
     )
-
-
-# ---------------------------------------------------------------------------
-# Live price source — Yahoo Finance chart endpoint
-# ---------------------------------------------------------------------------
-
-
-def fetch_yahoo_price(symbol: str) -> float | None:
-    """Latest price from Yahoo (regularMarketPrice → last 1m close)."""
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        f"?interval=1m&range=1d"
-    )
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        with urllib.request.urlopen(req, timeout=YAHOO_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode())
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
-        return None
-    except json.JSONDecodeError:
-        return None
-
-    result = (data.get("chart") or {}).get("result")
-    if not result:
-        return None
-    meta = result[0].get("meta") or {}
-    price = meta.get("regularMarketPrice")
-    if price is None:
-        # Fall back to last non-null 1-minute close on the chart.
-        indicators = (result[0].get("indicators") or {}).get("quote") or [{}]
-        closes = indicators[0].get("close") or []
-        valid = [c for c in closes if c is not None]
-        price = valid[-1] if valid else None
-    if price is None:
-        # Final fallback: previousClose so something useful prints during halts.
-        price = meta.get("previousClose")
-    return float(price) if price is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +139,9 @@ def format_row(plan: CandidatePlan, last: float | None, outcome) -> str:
     direction = f"{plan.direction.value:5}"
     last_str = f"{last:>8.2f}" if last is not None else "       —"
 
-    if last is None:
+    if outcome.decision == Decision.NO_PRICE:
         status = "NO PRICE"
-        action = "Yahoo price unavailable — skip this tick"
+        action = "market not tradeable / no quote"
     elif outcome.decision == Decision.FIRE:
         status = "🔥 FIRE"
         verb = "BUY" if plan.direction == Direction.LONG else "SELL"
@@ -198,9 +164,6 @@ def format_row(plan: CandidatePlan, last: float | None, outcome) -> str:
     elif outcome.decision == Decision.HOLD:
         status = "HOLD"
         action = "far from trigger"
-    elif outcome.decision == Decision.NO_PRICE:
-        status = "NO PRICE"
-        action = "skip"
     else:
         status = str(outcome.decision)
         action = "?"
@@ -230,12 +193,32 @@ def main() -> None:
     plans = [make_plan(e, scan_id) for e in entries]
     states = {p.candidate_id: CandidateRuntimeState() for p in plans}
 
+    # ── IG auth + market data ──────────────────────────────────────
+    print("Connecting to IG...")
+    session = IGSession()
+    session.connect()
+    market_data = MarketData(session)
+    print(f"  Connected ({session._settings.ig_acc_type.value} account).")
+
+    # Resolve epic per symbol once at startup.
+    print("Resolving IG epics:")
+    epics: dict[str, str] = {}
+    for plan in plans:
+        market_label = plan.market.value if hasattr(plan.market, "value") else str(plan.market)
+        try:
+            epic = market_data.resolve_epic(plan.symbol, market=market_label)
+            epics[plan.candidate_id] = epic
+            print(f"  {plan.symbol:6} {market_label:3} → {epic}")
+        except Exception as exc:
+            print(f"  {plan.symbol:6} {market_label:3} → FAILED ({exc})")
+            epics[plan.candidate_id] = None
+
     today = date.today()
-    # All current shortlists are US-session; UK switch is trivial if needed.
+    # All current shortlists are US-session; UK switch is a one-line change.
     clock = SessionClock.for_us_session(today)
 
     print(
-        f"Monitoring {len(plans)} candidate"
+        f"\nMonitoring {len(plans)} candidate"
         f"{'' if len(plans) == 1 else 's'}:"
     )
     for p in plans:
@@ -253,7 +236,7 @@ def main() -> None:
     print(
         f"\nSession entries open at {clock.entries_open_utc.isoformat()}"
         f"\nSession hard close   at {clock.hard_close_utc.isoformat()}"
-        f"\n\nPolling Yahoo every {POLL_SECONDS}s. Ctrl+C to stop."
+        f"\n\nPolling IG every {POLL_SECONDS}s. Ctrl+C to stop."
         f"\nThis tool NEVER places orders. You hit buy/sell yourself when FIRE shows."
         f"\nRules in force: Rule 9A BGU + Rule 22 strict breakout + session-clock gates."
         f"\n"
@@ -265,19 +248,21 @@ def main() -> None:
             ts = now.strftime("%Y-%m-%d %H:%M:%S UTC")
             print(f"=== {ts} ===")
             for plan in plans:
-                last = fetch_yahoo_price(plan.symbol)
-                snapshot = {
-                    "last_traded": last,
-                    "bid": last,
-                    "ask": last,
-                    "market_status": "TRADEABLE",
-                    "high": None,
-                    "low": None,
-                    "net_change": None,
-                    "pct_change": None,
-                    "update_time_utc": None,
-                    "scaling_factor": 1.0,
-                }
+                epic = epics.get(plan.candidate_id)
+                if not epic:
+                    print(
+                        f"  {plan.symbol:6} {plan.direction.value:5}        —  "
+                        f"NO EPIC       resolution failed at startup"
+                    )
+                    continue
+                try:
+                    snapshot = market_data.get_market_snapshot(epic)
+                except Exception as exc:
+                    print(
+                        f"  {plan.symbol:6} {plan.direction.value:5}        —  "
+                        f"FETCH ERR     {type(exc).__name__}: {exc}"
+                    )
+                    continue
                 state = states[plan.candidate_id]
                 outcome = classify_tick(
                     plan,
@@ -286,6 +271,7 @@ def main() -> None:
                     session_clock=clock,
                     now=now,
                 )
+                last = snapshot.get("last_traded") if snapshot else None
                 print(format_row(plan, last, outcome))
             print()
             time.sleep(POLL_SECONDS)
