@@ -334,9 +334,20 @@ Spread > 0.3% → reduce stake by 25%. Spread > 0.5% → SKIP entirely.
 
 Auto-exit / cover EOD before any earnings report. No exceptions.
 
-- **Where:** scanEmission emit-time check + executor pre-fire check
-- **Code status:** ⏳ PARTIAL — `eventFilter.js` exists in
-  swing-committee, gated by `EVENT_FILTER_ENABLED=1`. Off by default.
+- **Where:** scanEmission emit-time check (drops candidates with
+  earnings within ±5 days from the shortlist).
+- **Code status:** ✓ ENFORCED in code, **gated by env var**. Filter
+  in `swing-committee/lib/eventFilter.js` runs whenever
+  `EVENT_FILTER_ENABLED=1` AND a calendar payload is supplied. Tests
+  in `lib/scanEmission.test.mjs` confirm: tickers with imminent
+  earnings drop from the shortlist with `event_suppressions[]`
+  populated on the scan record.
+- **To enable in production:** set `EVENT_FILTER_ENABLED=1` in the
+  Vercel dashboard for the swing-committee project (Settings →
+  Environment Variables → Production), then redeploy. Verify by
+  running a scan that includes a ticker with earnings ≤ 5 days out
+  and confirming `scan_record.event_suppressions` is populated in
+  the downloaded JSON.
 - **Memory:** `feedback_event_filter_design`.
 
 ### Rule X5 — Sector correlation cap
@@ -435,7 +446,7 @@ Failed gap → 3-day window to reclaim, then quarantine for 10 days.
 | X1 Budget capacity | BOTH | executor | ⏳ |
 | X2 Position cap | BOTH | executor | ⏳ |
 | X3 UK spread | UK | executor | ⏳ ACTIVE (Mark 2026-04-28 trading UK) — display ✓, executor wiring needed |
-| X4 Earnings blackout | BOTH | scanEmission/exec | ⏳ off |
+| X4 Earnings blackout | BOTH | scanEmission/exec | ✓ in code, ⏳ env-flag off in Vercel — flip `EVENT_FILTER_ENABLED=1` to enable |
 | X5 Sector correlation | BOTH | executor | **DROPPED** (rare bind at N=3) |
 | 7 Scaling | BOTH | executor | OFF (design) |
 | 8 Order Types | BOTH | executor | ✓ |

@@ -204,6 +204,14 @@ class CandidateRuntimeState:
     opening_range_high: float | None = None
     opening_range_low: float | None = None
 
+    # ── Masterclass Rule 4-Chase ──────────────────────────────────────
+    # Set on the first observed tick if the session opened too far past
+    # the pivot (LONG: open > trigger_low * 1.03; SHORT: open <
+    # trigger_high * 0.97). When True, classify_tick returns
+    # REJECT(R23) on every subsequent tick that would otherwise fire.
+    # Per CANONICAL_ENTRY_RULES.md §Rule 4-Chase.
+    chase_violation: bool = False
+
     def has_close_event(self) -> bool:
         """True if terminal state was reached via a broker-close path.
 
@@ -330,6 +338,19 @@ def classify_tick(
             runtime.gap_up_detected = True
             runtime.opening_range_high = last
             runtime.opening_range_low = last
+        # Rule 4-Chase: if session opened more than 3% past the pivot,
+        # the move is already extended — flag for downstream rejection.
+        # Pivot = trigger_low for LONG, trigger_high for SHORT (the
+        # conservative side where the buy-stop sits in Masterclass §4).
+        # See docs/specs/CANONICAL_ENTRY_RULES.md §Rule 4-Chase.
+        if plan.direction == Direction.LONG:
+            chase_threshold = plan.trigger_low * 1.03
+            if last > chase_threshold:
+                runtime.chase_violation = True
+        else:
+            chase_threshold = plan.trigger_high * 0.97
+            if last < chase_threshold:
+                runtime.chase_violation = True
 
     # Track OR high/low while we're inside the window. Freezes after.
     or_elapsed_seconds: float | None = None
@@ -370,6 +391,15 @@ def classify_tick(
     if plan.direction == Direction.LONG:
         distance = last - plan.trigger_low  # ≥0 means price has entered zone
         if distance >= 0:
+            # ── Rule 4-Chase: open > pivot+3% → SKIP entirely ───
+            # Set on the first observed tick; once True, all in-zone
+            # ticks reject. Move is already extended; do not chase.
+            if runtime.chase_violation:
+                return TickOutcome(
+                    decision=Decision.REJECT,
+                    rejection_code="R23",
+                    distance_pts=distance,
+                )
             # ── Rule 9A BGU gate (LONG gap-up days only) ─────────
             # Inside the 15-min window: no entry, return R20.
             # After the window: require strict break above OR high.
@@ -420,6 +450,14 @@ def classify_tick(
     else:  # SHORT
         distance = plan.trigger_high - last  # ≥0 means price has entered zone
         if distance >= 0:
+            # ── Rule 4-Chase: open < pivot-3% → SKIP entirely ───
+            # Symmetric mirror of the LONG check above.
+            if runtime.chase_violation:
+                return TickOutcome(
+                    decision=Decision.REJECT,
+                    rejection_code="R23",
+                    distance_pts=distance,
+                )
             # ── Non-gap-down path: strict breakout below trigger_low ─
             # Symmetric to the LONG trigger-breakout gate. Rule 10 (gap-
             # down mirror of BGU) is deferred; for now SHORTs get only
@@ -448,6 +486,67 @@ def classify_tick(
         if -distance <= band_pts and not runtime.armed_emitted:
             return TickOutcome(decision=Decision.ARM, distance_pts=distance)
         return TickOutcome(decision=Decision.HOLD, distance_pts=distance)
+
+
+# ---------------------------------------------------------------------------
+# Pre-fire checks (Layer 4)
+# ---------------------------------------------------------------------------
+
+
+def _check_uk_spread_for_fire(
+    plan: "CandidatePlan",
+    snapshot: dict,
+) -> tuple[str, dict | None]:
+    """Pre-fire X3 UK spread filter (Masterclass §12 / desk reference).
+
+    Reads bid + ask from the snapshot and applies the canonical thresholds
+    from ``Settings.uk_spread_*``. Settings defaults: > 0.5% → SKIP,
+    > 0.3% → reduce stake by 25%.
+
+    Returns:
+        (action, info) where action is one of:
+          - 'fire'   — spread is fine (or rule N/A — US ticker / missing data)
+          - 'reduce' — reduce stake by ``reduction`` factor
+          - 'skip'   — refuse to fire (R_UK_SPREAD_SKIP)
+        and info is a dict with the relevant spread_pct + thresholds for
+        the caller to log.
+
+    Fail-open: if bid/ask are missing or zero, return 'fire' rather than
+    blocking. The rule is a UK-specific safety belt, not a hard gate that
+    should suppress US trades or trades during data hiccups.
+    """
+    if plan.market != Market.UK:
+        return ("fire", None)
+    bid = snapshot.get("bid")
+    ask = snapshot.get("ask")
+    if bid is None or ask is None or bid <= 0:
+        return ("fire", None)
+    spread_pct = (ask - bid) / bid
+
+    # Local import to avoid restructuring monitor.py imports — Settings is
+    # cached via lru_cache so the lookup cost is negligible per call.
+    from ..config.settings import get_settings
+
+    s = get_settings()
+
+    if spread_pct > s.uk_spread_skip_threshold:
+        return (
+            "skip",
+            {
+                "spread_pct": spread_pct,
+                "threshold": s.uk_spread_skip_threshold,
+            },
+        )
+    if spread_pct > s.uk_spread_reduce_threshold:
+        return (
+            "reduce",
+            {
+                "spread_pct": spread_pct,
+                "threshold": s.uk_spread_reduce_threshold,
+                "reduction": s.uk_spread_reduction,
+            },
+        )
+    return ("fire", None)
 
 
 # ---------------------------------------------------------------------------
@@ -935,6 +1034,36 @@ class MonitorLoop:
             self._emit_entry_evaluated_no_enter(plan, snapshot, now, "R_NO_STAKE")
             return
 
+        # ── Rule X3 — UK spread filter (Masterclass §12) ──────────────────
+        # UK spread > 0.5% → SKIP entirely. > 0.3% → reduce stake by 25%.
+        # See docs/specs/CANONICAL_ENTRY_RULES.md and feedback_ig_price_scaling.
+        # Settings.uk_spread_{skip,reduce}_threshold + uk_spread_reduction.
+        spread_action, spread_info = _check_uk_spread_for_fire(plan, snapshot)
+        effective_stake = plan.planned_stake_gbp_per_pt
+        if spread_action == "skip":
+            logger.warning(
+                "FIRE for %s but UK spread %.3f%% > %.3f%% skip threshold — refusing.",
+                plan.symbol,
+                spread_info["spread_pct"] * 100,
+                spread_info["threshold"] * 100,
+            )
+            state.fired = True
+            self._emit_entry_evaluated_no_enter(
+                plan, snapshot, now, "R_UK_SPREAD_SKIP"
+            )
+            return
+        if spread_action == "reduce":
+            reduction = spread_info["reduction"]
+            effective_stake = plan.planned_stake_gbp_per_pt * reduction
+            logger.info(
+                "UK spread %.3f%% > %.3f%% reduce threshold — stake %.2f → %.2f (×%.2f).",
+                spread_info["spread_pct"] * 100,
+                spread_info["threshold"] * 100,
+                plan.planned_stake_gbp_per_pt,
+                effective_stake,
+                reduction,
+            )
+
         # Compute the grade-scaled £ take-profit limit to attach at IG.
         # Lazy-import to avoid the monitor↔trail_manager cycle at top level.
         from .trail_manager import get_hard_target_gbp
@@ -947,7 +1076,7 @@ class MonitorLoop:
             epic=plan.ig_epic,
             direction=plan.direction,
             entry_price=entry_ref,
-            size=plan.planned_stake_gbp_per_pt,
+            size=effective_stake,
             target_gbp=target_gbp,
         )
         if limit_level_scan is None:
@@ -965,7 +1094,7 @@ class MonitorLoop:
         result = self.broker.place_open_position(
             epic=plan.ig_epic,
             direction=plan.direction,
-            size=plan.planned_stake_gbp_per_pt,
+            size=effective_stake,
             stop_price=plan.stop_price,
             limit_level=limit_level_scan,
         )

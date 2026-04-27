@@ -45,6 +45,12 @@ class RejectCode(str, Enum):
     # See feedback_trigger_semantics. TMUS 2026-04-24 motivates it.
     R22 = "R22"  # Trigger zone entered; awaiting strict breakout of outer bound
 
+    # Chase rule (Masterclass §4 / desk reference). If the day opens too
+    # far above the pivot (LONG) or below it (SHORT), the move is already
+    # extended — skip the trade. 'Wait for pullback. Never chase.'
+    # See docs/specs/CANONICAL_ENTRY_RULES.md §Rule 4-Chase.
+    R23 = "R23"  # Chase rule: open > pivot+3% (LONG) or open < pivot-3% (SHORT)
+
     @property
     def description(self) -> str:
         return _DESCRIPTIONS[self]
@@ -81,6 +87,10 @@ _DESCRIPTIONS: dict[RejectCode, str] = {
         "Trigger zone entered; awaiting strict breakout above trigger_high "
         "(LONG) or below trigger_low (SHORT)"
     ),
+    RejectCode.R23: (
+        "Chase rule: session opened more than 3% beyond pivot — move is "
+        "already extended, wait for pullback"
+    ),
 }
 
 _APPLIES_TO: dict[RejectCode, str] = {
@@ -106,4 +116,5 @@ _APPLIES_TO: dict[RejectCode, str] = {
     RejectCode.R20: "LONG",
     RejectCode.R21: "LONG",
     RejectCode.R22: "BOTH",
+    RejectCode.R23: "BOTH",
 }
