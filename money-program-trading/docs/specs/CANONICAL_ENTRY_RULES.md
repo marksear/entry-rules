@@ -212,12 +212,29 @@ whichever is earlier. Past cutoff → suppress FIRE.
 
 ### Rule 4 — Pivot Buy (LONG L-A) / Pivot Short-Sell (SHORT S-A)
 
-Strict breakout entry. LONG: buy-stop placed 1-2% above pivot. SHORT:
-sell-stop 1-2% below neckline. Tick that crosses the trigger
-**strictly** (not just inside zone) is the entry signal.
+Strict breakout entry. LONG: buy-stop placed 0.5×ATR14 above pivot.
+SHORT: sell-stop 0.5×ATR14 below neckline. Tick that crosses the
+trigger **strictly** (not just inside zone) is the entry signal.
+
+The **0.5×ATR zone width** (Raschke / Masterclass canonical "natural
+volatility unit") replaces the legacy fixed 3% buffer (changed
+2026-04-28). Reasoning: a fixed 3% buffer ignores each stock's natural
+volatility — KO ($80) and NVDA ($209) both got 3%, but a 3% NVDA move
+is over a full ATR of slack and effectively unreachable inside the
+intraday-managed window. ATR-scaling adapts proportionally to each
+stock and matches what Raschke / Minervini call "above the pivot, but
+not chasing".
+
+The arithmetic is computed deterministically server-side in
+`swing-committee/lib/triggerDerivation.js` (see `docs/lean_scan_spec.md`
+§4.6) and must remain in lockstep with the Python backtest harness in
+`money-program-trading/src/backtest/replay_scanner.py`.
 
 - **Applies to:** L-A (LONG) / S-A (SHORT) primarily; informs **Rule 22**
+- **Zone formula (LONG):** `trigger_low = lastClose; trigger_high = lastClose + ATR14 × 0.5`
+- **Zone formula (SHORT):** `trigger_high = lastClose; trigger_low = lastClose − ATR14 × 0.5`
 - **Code status:** ✓ ENFORCED via Rule 22 (commit `008d200` 2026-04-24).
+  Zone formula updated 2026-04-28 — pending commit on swing-committee main.
 - **Memory:** `feedback_trigger_semantics`.
 
 ### Rule 4-Chase — Open > pivot + 3% → SKIP
