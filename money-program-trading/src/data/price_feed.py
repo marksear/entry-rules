@@ -222,7 +222,13 @@ class RestPriceFeed(PriceFeed):
         instrument = result.get("instrument") or {}
         bid_raw = _f(snap.get("bid"))
         offer_raw = _f(snap.get("offer"))
-        scaling_factor = resolve_scaling_factor(epic, instrument, bid_raw, offer_raw)
+        # Pass snap so resolve_scaling_factor can use snapshot.scalingFactor
+        # (IG's authoritative per-market answer — surfaced 2026-04-29 after
+        # the RKT bug). Falls through to instrument/heuristic path for
+        # back-compat with older fixtures.
+        scaling_factor = resolve_scaling_factor(
+            epic, instrument, bid_raw, offer_raw, snapshot=snap,
+        )
         self._scale_cache[epic] = scaling_factor
 
         last_traded_raw = None
@@ -359,6 +365,11 @@ class LightstreamerPriceFeed(PriceFeed):
         self._degraded_seconds = degraded_seconds
         self._scale_cache: dict[str, float] = {}
         self._instrument_cache: dict[str, dict] = {}
+        # Cached IG snapshot block per epic — its ``scalingFactor`` is the
+        # authoritative answer for UK shares (instrument block omits it).
+        # Populated alongside ``_instrument_cache`` in
+        # ``_preload_instrument_metadata``. Static across the session.
+        self._snapshot_cache: dict[str, dict] = {}
         self._tick_cache: dict[str, Tick] = {}
         self._subscriptions: dict[str, object] = {}
         self._lock = threading.Lock()
@@ -489,10 +500,19 @@ class LightstreamerPriceFeed(PriceFeed):
     # ── Internal helpers ──────────────────────────────────────
 
     def _preload_instrument_metadata(self, epic: str) -> None:
-        """One-time REST call to cache the ``instrument`` block so the
-        first incoming LS tick can resolve scalingFactor without another
-        network round-trip. Ignores errors — the scaling fallback
-        heuristic works on bid/ask alone if instrument is empty."""
+        """One-time REST call to cache the ``instrument`` AND ``snapshot``
+        blocks so the first incoming LS tick can resolve scalingFactor
+        without another network round-trip.
+
+        The snapshot is required because IG populates ``scalingFactor``
+        there (not on the instrument block) for at least UK shares —
+        surfaced 2026-04-29 after the RKT bug. The cached snapshot is
+        used as a static reference for scaling only; live bid/ask come
+        from the LS subscription.
+
+        Ignores errors — the scaling fallback heuristic works on bid/ask
+        alone if both instrument and snapshot are empty.
+        """
         if epic in self._instrument_cache:
             return
         try:
@@ -501,8 +521,10 @@ class LightstreamerPriceFeed(PriceFeed):
                 result = result.model_dump()
             if isinstance(result, dict):
                 self._instrument_cache[epic] = result.get("instrument") or {}
+                self._snapshot_cache[epic] = result.get("snapshot") or {}
             else:
                 self._instrument_cache[epic] = {}
+                self._snapshot_cache[epic] = {}
         except Exception as e:
             logger.warning(
                 "LS preload instrument metadata for %s failed: %s — "
@@ -510,6 +532,7 @@ class LightstreamerPriceFeed(PriceFeed):
                 epic, e,
             )
             self._instrument_cache[epic] = {}
+            self._snapshot_cache[epic] = {}
 
     def _on_tick(self, epic: str, item_update: object) -> None:
         """Called (on the LS thread) for each incoming MARKET update.
@@ -518,8 +541,12 @@ class LightstreamerPriceFeed(PriceFeed):
         bid_raw = _safe_float(get("BID"))
         ask_raw = _safe_float(get("OFFER"))
         instrument = self._instrument_cache.get(epic) or {}
+        snapshot = self._snapshot_cache.get(epic) or {}
+        # Pass cached snapshot — its ``scalingFactor`` is IG's authoritative
+        # per-market answer (UK shares populate this; instrument block is
+        # often empty). Surfaced 2026-04-29 (RKT bug).
         scaling_factor = resolve_scaling_factor(
-            epic, instrument, bid_raw, ask_raw,
+            epic, instrument, bid_raw, ask_raw, snapshot=snapshot,
         )
         self._scale_cache[epic] = scaling_factor
 

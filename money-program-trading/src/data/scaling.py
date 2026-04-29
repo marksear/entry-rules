@@ -54,6 +54,12 @@ def _looks_like_minor_units(bid: Optional[float], ask: Optional[float]) -> bool:
     rather than dollars. Returning False when we can't tell (both None)
     keeps us on the safe side — we only override the default to 100 when
     the evidence is positive.
+
+    NOTE: this heuristic is US-equity-specific. For UK shares the same
+    >1500 threshold gives a false positive — UK shares trade in pence
+    natively and any £15+ stock will exceed 1500p. Callers must guard
+    with ``_is_gbp_share`` before applying the ×100 fallback (see
+    ``resolve_scaling_factor``).
     """
     for v in (bid, ask):
         if v is not None and v > 1500:
@@ -61,27 +67,65 @@ def _looks_like_minor_units(bid: Optional[float], ask: Optional[float]) -> bool:
     return False
 
 
+def _is_gbp_share(instrument: Optional[dict]) -> bool:
+    """True iff IG's instrument metadata reports the primary currency as
+    GBP/GBX (UK pence). Used to suppress the US-equity ×100 fallback
+    heuristic for high-priced UK shares (RKT, AZN, ULVR, BLT, etc.).
+
+    The 2026-04-29 RKT bug: bid 4682.3 (correct pence for Reckitt at
+    £46.82) tripped ``_looks_like_minor_units`` and was wrongly divided
+    by 100. The native scaling=1 was hidden in ``snapshot.scalingFactor``
+    which the resolver wasn't consulting. After this guard lands, even
+    if the snapshot path is bypassed the fallback won't fire on GBP
+    shares.
+
+    Returns False when the instrument dict is empty or currency is
+    missing — the conservative default is "don't apply fallback unless
+    we're confident it's a US equity". Old behaviour preserved for the
+    AMD/FDX cases that originally motivated the heuristic.
+    """
+    if not isinstance(instrument, dict):
+        return False
+    currs = instrument.get("currencies") or []
+    if not currs:
+        return False
+    first = currs[0]
+    if not isinstance(first, dict):
+        return False
+    code = str(first.get("code") or "").upper()
+    return code in ("GBP", "GBX")
+
+
 def resolve_scaling_factor(
     epic: str,
     instrument: Optional[dict],
     bid_raw: Optional[float],
     ask_raw: Optional[float],
+    snapshot: Optional[dict] = None,
 ) -> float:
     """
     Resolve the scaling factor for ``epic`` using IG's instrument metadata
     plus the US-equity-DAILY.IP fallback heuristic.
 
     Precedence (highest first):
-    1. ``instrument['scalingFactor']`` if present and > 0 — use it verbatim.
-    2. ``100.0`` if (a) the epic looks like a single-name equity spread-bet
-       AND (b) raw bid/ask look like minor units (one > 1500). Logs a
-       warning so a reviewer can audit the fallback.
-    3. ``1.0`` default — logs an info line with the instrument type for
+    1. ``snapshot['scalingFactor']`` if present and > 0 — IG's
+       authoritative per-snapshot answer. **Added 2026-04-29** after the
+       RKT bug exposed that IG populates this field on the snapshot
+       block, not the instrument block, for at least UK shares. Old
+       callers that don't pass ``snapshot`` get the historical behaviour.
+    2. ``instrument['scalingFactor']`` if present and > 0 — use verbatim.
+       Historical path; appears to be empty for many newer epics.
+    3. ``100.0`` if (a) the epic looks like a single-name equity spread-bet
+       AND (b) raw bid/ask look like minor units (one > 1500) AND
+       (c) the instrument is NOT a GBP/GBX share. The GBP guard prevents
+       the false-positive on high-priced UK shares (Reckitt, AstraZeneca,
+       Unilever, etc. all trade above 1500p in native pence).
+    4. ``1.0`` default — logs an info line with the instrument type for
        diagnosis.
 
     This function is intentionally pure: no caching, no IG calls. The
     caller owns the cache. See ``RestPriceFeed._scale_cache`` /
-    ``LightstreamerPriceFeed._scale_cache`` (Phase 2).
+    ``LightstreamerPriceFeed._scale_cache``.
     """
     def _f(v):
         if v is None or v == "":
@@ -91,6 +135,25 @@ def resolve_scaling_factor(
         except (TypeError, ValueError):
             return None
 
+    # 1. Snapshot-level scalingFactor — IG's authoritative answer when
+    #    present. Surfaced 2026-04-29: Reckitt's KA.D.RB.DAILY.IP returns
+    #    snapshot.scalingFactor=1, decimalPlacesFactor=1, but the
+    #    instrument block omits scalingFactor entirely. Without this
+    #    branch the fallback heuristic kicked in and divided 4682.3p
+    #    by 100.
+    snap_sf = None
+    if isinstance(snapshot, dict):
+        snap_sf = _f(snapshot.get("scalingFactor"))
+    if snap_sf is not None and snap_sf > 0:
+        logger.debug(
+            "resolve_scaling_factor: %s — scalingFactor=%s from snapshot",
+            epic, snap_sf,
+        )
+        return snap_sf
+
+    # 2. Instrument-level scalingFactor — historical path. Still used
+    #    by older fixtures and any future epic family that populates
+    #    here instead of the snapshot.
     raw_sf = None
     if isinstance(instrument, dict):
         raw_sf = instrument.get("scalingFactor")
@@ -98,13 +161,21 @@ def resolve_scaling_factor(
 
     if scaling_factor is not None and scaling_factor > 0:
         logger.debug(
-            "resolve_scaling_factor: %s — scalingFactor=%s from IG",
+            "resolve_scaling_factor: %s — scalingFactor=%s from instrument",
             epic, scaling_factor,
         )
         return scaling_factor
 
-    if _looks_like_equity_spreadbet(epic, instrument) and _looks_like_minor_units(
-        bid_raw, ask_raw
+    # 3. Equity minor-units fallback — but ONLY for non-GBP shares. The
+    #    >1500 threshold was written for US equities quoted in cents,
+    #    where "raw bid > 1500" is a near-certain "this is cents not
+    #    dollars" signal. UK shares trade in pence natively and any
+    #    £15+ stock breaks the heuristic. The GBP guard below is the
+    #    direct fix for the 2026-04-29 RKT bug.
+    if (
+        _looks_like_equity_spreadbet(epic, instrument)
+        and _looks_like_minor_units(bid_raw, ask_raw)
+        and not _is_gbp_share(instrument)
     ):
         logger.warning(
             "get_market_snapshot: %s — scalingFactor missing/invalid "

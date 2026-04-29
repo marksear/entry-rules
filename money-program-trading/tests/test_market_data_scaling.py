@@ -434,3 +434,193 @@ def test_search_market_skips_dated_rows_and_picks_daily():
     )
     md = _make_market_data(FakeIGService(search_response=results))
     assert md._search_market("AAPL", "US") == "UA.D.AAPL.DAILY.IP"
+
+
+# ---------------------------------------------------------------------------
+# 2026-04-29 RKT regression — UK pence-quoted shares above 1500p
+# ---------------------------------------------------------------------------
+#
+# The bug: KA.D.RB.DAILY.IP (Reckitt Benckiser) returns bid 4682.3 in
+# pence with snapshot.scalingFactor=1, but the instrument block omits
+# scalingFactor. The old fallback path kicked in (bid > 1500 + type
+# SHARES) and divided every price by 100, so the live monitor saw
+# Reckitt at 46.82 instead of 4682p. Rule 4-Chase then rejected with
+# R23 (open way below pivot).
+#
+# Fix is layered:
+#   (a) resolve_scaling_factor now consults snapshot.scalingFactor first,
+#       which is IG's authoritative answer.
+#   (b) the >1500 fallback heuristic is suppressed when instrument
+#       currency is GBP/GBX, so even if the snapshot path were bypassed
+#       the heuristic wouldn't fire on UK shares.
+
+
+def test_snapshot_scaling_factor_takes_precedence_over_instrument():
+    """RKT-shape: snapshot says scalingFactor=1, instrument is empty. The
+    correct answer is 1.0 — IG's snapshot is authoritative. Without this
+    branch the fallback heuristic would run on bid=4682.3 and incorrectly
+    return 100."""
+    ig = FakeIGService(
+        markets_response={
+            "instrument": {
+                "type": "SHARES",
+                "name": "Reckitt Benckiser Group PLC",
+                "currencies": [{"code": "GBP", "symbol": "£", "isDefault": True}],
+            },
+            "snapshot": {
+                "bid": 4682.3,
+                "offer": 4694.7,
+                "lastTraded": 4688.5,
+                "high": 4760.7,
+                "low": 4682.3,
+                "scalingFactor": 1,
+                "decimalPlacesFactor": 1,
+                "marketStatus": "TRADEABLE",
+            },
+        }
+    )
+    md = _make_market_data(ig)
+
+    snap = md.get_market_snapshot("KA.D.RB.DAILY.IP")
+
+    assert snap["scaling_factor"] == 1.0, (
+        "RB has snapshot.scalingFactor=1; resolver must honour it and NOT "
+        "divide by 100 via the fallback heuristic."
+    )
+    assert snap["bid"] == pytest.approx(4682.3)
+    assert snap["ask"] == pytest.approx(4694.7)
+    assert snap["last_traded"] == pytest.approx(4688.5)
+
+
+def test_uk_share_above_1500_not_scaled_when_currency_gbp():
+    """Defence-in-depth: even if the snapshot path is bypassed (no
+    snapshot.scalingFactor at all), a GBP share with bid > 1500p must
+    NOT trip the ×100 fallback. Catches the RKT class of bug if any
+    future epic family ships without snapshot.scalingFactor."""
+    ig = FakeIGService(
+        markets_response={
+            "instrument": {
+                "type": "SHARES",
+                "name": "Reckitt Benckiser Group PLC",
+                "currencies": [{"code": "GBP", "symbol": "£", "isDefault": True}],
+                # Note: no scalingFactor anywhere on instrument
+            },
+            "snapshot": {
+                "bid": 4682.3,
+                "offer": 4694.7,
+                "lastTraded": 4688.5,
+                "marketStatus": "TRADEABLE",
+                # Note: no scalingFactor on snapshot either
+            },
+        }
+    )
+    md = _make_market_data(ig)
+
+    snap = md.get_market_snapshot("KA.D.RB.DAILY.IP")
+
+    assert snap["scaling_factor"] == 1.0, (
+        "GBP share above 1500p must not trip the US-equity ×100 fallback; "
+        "those are pence, not cents."
+    )
+    assert snap["bid"] == pytest.approx(4682.3)
+
+
+def test_us_equity_above_1500_still_scaled_when_currency_usd():
+    """Belt-and-braces for the original FDX/AMD case: USD currency with
+    bid > 1500 must STILL hit the ×100 fallback. The new currency-aware
+    guard only suppresses the heuristic for GBP/GBX, not USD."""
+    ig = FakeIGService(
+        markets_response={
+            "instrument": {
+                "type": "SHARES",
+                "name": "FedEx Corp",
+                "currencies": [{"code": "USD", "symbol": "$", "isDefault": True}],
+                # No scalingFactor on instrument — historical FDX bug shape
+            },
+            "snapshot": {
+                "bid": 39080.5,
+                "offer": 39120.0,
+                "lastTraded": 39100.5,
+                "marketStatus": "TRADEABLE",
+                # No scalingFactor on snapshot — forces fallback path
+            },
+        }
+    )
+    md = _make_market_data(ig)
+
+    snap = md.get_market_snapshot("SC.D.FDX.DAILY.IP")
+
+    assert snap["scaling_factor"] == 100.0, (
+        "USD equity above 1500 must still hit the ×100 fallback — that's "
+        "the original FDX/AMD bug the heuristic exists for."
+    )
+    assert snap["last_traded"] == pytest.approx(391.005)
+
+
+def test_resolve_scaling_factor_unit_snapshot_path():
+    """Direct unit test of resolve_scaling_factor: snapshot.scalingFactor
+    short-circuits everything else."""
+    from src.data.scaling import resolve_scaling_factor
+
+    sf = resolve_scaling_factor(
+        epic="KA.D.RB.DAILY.IP",
+        instrument={"type": "SHARES", "name": "Reckitt"},
+        bid_raw=4682.3,
+        ask_raw=4694.7,
+        snapshot={"scalingFactor": 1},
+    )
+    assert sf == 1.0
+
+
+def test_resolve_scaling_factor_unit_gbp_guard():
+    """Direct unit test: GBP share with no scaling info anywhere returns
+    1.0 even when bid > 1500. The currency guard wins over the heuristic."""
+    from src.data.scaling import resolve_scaling_factor
+
+    sf = resolve_scaling_factor(
+        epic="KA.D.RB.DAILY.IP",
+        instrument={
+            "type": "SHARES",
+            "currencies": [{"code": "GBP", "isDefault": True}],
+        },
+        bid_raw=4682.3,
+        ask_raw=4694.7,
+        snapshot=None,
+    )
+    assert sf == 1.0
+
+
+def test_resolve_scaling_factor_unit_usd_fallback_still_works():
+    """Direct unit test: USD share with no scaling info but bid > 1500
+    still gets the ×100 treatment (preserves the original behaviour)."""
+    from src.data.scaling import resolve_scaling_factor
+
+    sf = resolve_scaling_factor(
+        epic="SC.D.FDX.DAILY.IP",
+        instrument={
+            "type": "SHARES",
+            "currencies": [{"code": "USD", "isDefault": True}],
+        },
+        bid_raw=39080.5,
+        ask_raw=39120.0,
+        snapshot=None,
+    )
+    assert sf == 100.0
+
+
+def test_resolve_scaling_factor_back_compat_no_snapshot_arg():
+    """Old call sites that don't pass snapshot still work. Defaults to
+    None which falls through to the instrument/heuristic path."""
+    from src.data.scaling import resolve_scaling_factor
+
+    # USD share, no scalingFactor anywhere, bid > 1500 → fallback ×100.
+    sf = resolve_scaling_factor(
+        epic="SC.D.FDX.DAILY.IP",
+        instrument={
+            "type": "SHARES",
+            "currencies": [{"code": "USD", "isDefault": True}],
+        },
+        bid_raw=39080.5,
+        ask_raw=39120.0,
+    )
+    assert sf == 100.0
