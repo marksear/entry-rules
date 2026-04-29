@@ -52,6 +52,7 @@ have passed (or it would not be shortlisted).
 | S2  | Last price available       | snapshot.last_traded non-null → else NO_PRICE               | ✓ |
 | S3  | Entries-open               | US ≥ 09:45 ET, UK ≥ 08:15 UK (R_SESSION_PREMATURE)          | ✓ 2026-04-24 |
 | S4  | Entries-cutoff             | US default 14:30 ET / session_end − 60min (R_SESSION_CUTOFF) | ✓ |
+| S5  | Day-trade cutoff           | US ≤ 11:15 ET, UK ≤ 10:30 UK (R_DAY_TRADE_CUTOFF, LBR-aligned) | ✓ 2026-04-29 |
 | 4   | Pivot Buy / Pivot Short    | Strict breakout. LONG > trigger_high, SHORT < trigger_low.  | ✓ via Rule 22 |
 | 4-C | Open > pivot ± 3% (no BGU) | Skip if open chases > 3% past pivot without gap-up qualifier | ✓ ENFORCED 2026-04-28 (#58) |
 | 5   | Volume confirm 1.4×        | Breakout candle volume ≥ 1.4× 50-day avg                    | DROPPED — intraday-only |
@@ -99,6 +100,7 @@ Masterclass canonical). Was fixed 3% — changed 2026-04-28.
 |-----------------------|---------------------------------------------------------|
 | `R_SESSION_PREMATURE` | Tick before 09:45 ET / 08:15 UK (S3)                    |
 | `R_SESSION_CUTOFF`    | Tick after entries-cutoff (S4)                          |
+| `R_DAY_TRADE_CUTOFF`  | Tick after 11:15 ET / 10:30 UK (S5 — LBR day-trade)     |
 | `R20`                 | Inside 15-min opening range (Rule 9A — wait)            |
 | `R21`                 | After OR window but no break of OR_high (Rule 9A)       |
 | `R22`                 | Inside trigger zone, no strict breakout (Rule 22)       |

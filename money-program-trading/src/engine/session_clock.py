@@ -85,6 +85,19 @@ UK_SESSION_CLOSE_UK_LOCAL: time = time(hour=16, minute=30)
 # FTSE regular hours open: 08:00 Europe/London.
 UK_SESSION_OPEN_UK_LOCAL: time = time(hour=8, minute=0)
 
+# ─── LBR day-trade entry cutoff (Task 2026-04-29 — Rule S5) ──────────────
+# Linda Bradford Raschke / standard intraday discipline: directional day
+# trades should be initiated in the first ~1.5 hours after the market open.
+# After this point the morning's directional regime has typically played
+# out — afternoon entries chase mature moves with deteriorated R:R.
+#
+# This is a SECOND, EARLIER entries cutoff than the existing
+# ``entries_cutoff_utc`` (which is risk-management-driven: stop opening
+# positions in the closing window). The day-trade cutoff is entry-quality-
+# driven: stop opening positions when the morning's signal is stale.
+DEFAULT_US_DAY_TRADE_CUTOFF_ET_LOCAL: time = time(hour=11, minute=15)
+DEFAULT_UK_DAY_TRADE_CUTOFF_UK_LOCAL: time = time(hour=10, minute=30)
+
 
 @dataclass(frozen=True)
 class SessionClock:
@@ -99,6 +112,12 @@ class SessionClock:
     hard_close_utc: datetime
     entries_cutoff_utc: datetime
     entries_open_utc: datetime
+    # Rule S5 / Task #71 (LBR day-trade cutoff): a second, earlier
+    # entries-cutoff for intraday-managed entries. None disables the
+    # gate (back-compat with old fixtures + tests). When set, an
+    # entry that would otherwise FIRE past this UTC time returns
+    # REJECT(R_DAY_TRADE_CUTOFF) instead.
+    day_trade_cutoff_utc: datetime | None = None
 
     # Retained for observability / debugging; not needed by the decision path.
     hard_close_buffer_minutes: int = DEFAULT_HARD_CLOSE_BUFFER_MINUTES
@@ -139,6 +158,25 @@ class SessionClock:
         """
         return _as_utc(now) < self.entries_open_utc
 
+    def is_past_day_trade_cutoff(self, now: datetime) -> bool:
+        """True once ``now`` has crossed ``day_trade_cutoff_utc``
+        (Rule S5, LBR-aligned 2026-04-29).
+
+        Returns False when ``day_trade_cutoff_utc`` is None — the gate
+        is opt-in via the builder argument so older fixtures and tests
+        keep their existing behaviour.
+
+        When this returns True, ``classify_tick`` returns
+        ``REJECT(R_DAY_TRADE_CUTOFF)`` even if the strict-break trigger
+        has fired. Rationale: directional day-trade entries should
+        initiate in the first ~1.5h post-open; later entries chase
+        mature moves with deteriorated R:R and are rule-violations of
+        the intraday-managed profile.
+        """
+        if self.day_trade_cutoff_utc is None:
+            return False
+        return _as_utc(now) >= self.day_trade_cutoff_utc
+
     def minutes_to_session_end(self, now: datetime) -> int:
         """Signed minutes remaining until ``session_end_utc``.
 
@@ -162,6 +200,7 @@ class SessionClock:
         no_new_entries_buffer_minutes: int = DEFAULT_NO_NEW_ENTRIES_BUFFER_MINUTES,
         opening_buffer_minutes: int = DEFAULT_OPENING_BUFFER_MINUTES,
         last_entry_cutoff_uk_local: time | None = DEFAULT_US_LAST_ENTRY_CUTOFF_UK_LOCAL,
+        day_trade_cutoff_local: time | None = DEFAULT_US_DAY_TRADE_CUTOFF_ET_LOCAL,
     ) -> "SessionClock":
         """Build a clock for a NYSE regular-hours session.
 
@@ -177,6 +216,11 @@ class SessionClock:
 
         ``opening_buffer_minutes`` defaults to 15 — no new entries before
         09:45 ET. See :attr:`is_before_entries_open` for rationale.
+
+        ``day_trade_cutoff_local`` is the LBR-aligned intraday-managed
+        entries cutoff (Rule S5, default 11:15 ET). Setting to None
+        disables the gate — back-compat for fixtures that don't expect
+        the new rejection.
         """
         session_end_utc = _local_time_to_utc(
             session_date_local, US_SESSION_CLOSE_ET_LOCAL, "America/New_York"
@@ -184,6 +228,11 @@ class SessionClock:
         session_open_utc = _local_time_to_utc(
             session_date_local, US_SESSION_OPEN_ET_LOCAL, "America/New_York"
         )
+        day_trade_cutoff_utc: datetime | None = None
+        if day_trade_cutoff_local is not None:
+            day_trade_cutoff_utc = _local_time_to_utc(
+                session_date_local, day_trade_cutoff_local, "America/New_York"
+            )
         return cls._build(
             session_end_utc=session_end_utc,
             session_open_utc=session_open_utc,
@@ -192,6 +241,7 @@ class SessionClock:
             no_new_entries_buffer_minutes=no_new_entries_buffer_minutes,
             opening_buffer_minutes=opening_buffer_minutes,
             last_entry_cutoff_uk_local=last_entry_cutoff_uk_local,
+            day_trade_cutoff_utc=day_trade_cutoff_utc,
             market_label="US",
         )
 
@@ -204,6 +254,7 @@ class SessionClock:
         no_new_entries_buffer_minutes: int = DEFAULT_NO_NEW_ENTRIES_BUFFER_MINUTES,
         opening_buffer_minutes: int = DEFAULT_OPENING_BUFFER_MINUTES,
         last_entry_cutoff_uk_local: time | None = None,
+        day_trade_cutoff_local: time | None = DEFAULT_UK_DAY_TRADE_CUTOFF_UK_LOCAL,
     ) -> "SessionClock":
         """Build a clock for an LSE regular-hours session (FTSE 15).
 
@@ -213,6 +264,10 @@ class SessionClock:
 
         ``opening_buffer_minutes`` defaults to 15 — no new entries before
         08:15 UK. Same rationale as the US session.
+
+        ``day_trade_cutoff_local`` is the LBR-aligned intraday-managed
+        entries cutoff (Rule S5, default 10:30 UK = 2.5 h post-open).
+        Setting to None disables the gate.
         """
         session_end_utc = _local_time_to_utc(
             session_date_local, UK_SESSION_CLOSE_UK_LOCAL, "Europe/London"
@@ -220,6 +275,11 @@ class SessionClock:
         session_open_utc = _local_time_to_utc(
             session_date_local, UK_SESSION_OPEN_UK_LOCAL, "Europe/London"
         )
+        day_trade_cutoff_utc: datetime | None = None
+        if day_trade_cutoff_local is not None:
+            day_trade_cutoff_utc = _local_time_to_utc(
+                session_date_local, day_trade_cutoff_local, "Europe/London"
+            )
         return cls._build(
             session_end_utc=session_end_utc,
             session_open_utc=session_open_utc,
@@ -228,6 +288,7 @@ class SessionClock:
             no_new_entries_buffer_minutes=no_new_entries_buffer_minutes,
             opening_buffer_minutes=opening_buffer_minutes,
             last_entry_cutoff_uk_local=last_entry_cutoff_uk_local,
+            day_trade_cutoff_utc=day_trade_cutoff_utc,
             market_label="UK",
         )
 
@@ -247,6 +308,7 @@ class SessionClock:
         opening_buffer_minutes: int,
         last_entry_cutoff_uk_local: time | None,
         market_label: str,
+        day_trade_cutoff_utc: datetime | None = None,
     ) -> "SessionClock":
         hard_close_utc = session_end_utc - timedelta(
             minutes=hard_close_buffer_minutes
@@ -281,6 +343,7 @@ class SessionClock:
             hard_close_utc=hard_close_utc,
             entries_cutoff_utc=entries_cutoff_utc,
             entries_open_utc=entries_open_utc,
+            day_trade_cutoff_utc=day_trade_cutoff_utc,
             hard_close_buffer_minutes=hard_close_buffer_minutes,
             no_new_entries_buffer_minutes=no_new_entries_buffer_minutes,
             opening_buffer_minutes=opening_buffer_minutes,

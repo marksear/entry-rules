@@ -210,20 +210,64 @@ whichever is earlier. Past cutoff → suppress FIRE.
 - **Applies to:** BOTH
 - **Code status:** ✓ ENFORCED.
 
+### Rule S5 — Day-trade entry cutoff (R_DAY_TRADE_CUTOFF)
+
+Linda Bradford Raschke / standard intraday discipline: directional
+day-trade entries should initiate within the first ~1.5 hours after
+the market open. After 11:15 ET (US) / 10:30 UK (UK), the morning's
+directional regime has typically played out — afternoon entries chase
+mature moves with deteriorated R:R and break the intraday-managed
+profile's structural assumptions.
+
+This is a SECOND, EARLIER entries cutoff than Rule S4. Rule S4 is
+**risk-management-driven** (don't open a position you can't manage to
+close); Rule S5 is **entry-quality-driven** (don't open a position
+when the morning's signal is stale). Past Rule S5's threshold,
+classify_tick returns REJECT(R_DAY_TRADE_CUTOFF) even if the strict-
+break trigger has fired.
+
+The rule is opt-in via `SessionClock.day_trade_cutoff_local`. Default
+ON for both US (11:15 ET) and UK (10:30 UK) sessions. Pass
+`day_trade_cutoff_local=None` to disable for back-compat.
+
+The motivating data point: 2026-04-29 LMT short setup. The breakdown
+played out 10:00-10:30 ET (price 514 → 504), but Rule 22 strict-break
+of trigger_low (503.90) didn't fire until 10:39 ET — by which time
+most of the move was gone. With Rule S5 at 11:15 ET, late entries
+past 11:15 are rejected outright; with the tightened 0.35×ATR zone
+(see Rule 4) the strict break would have fired at 506.42 around
+10:25 ET — well within the 11:15 cutoff. The two rules work as a
+pair: the tighter zone fires earlier, the cutoff guards against
+chasing.
+
+- **Applies to:** BOTH
+- **Code status:** ✓ ENFORCED — commit pending 2026-04-29.
+- **Memory:** captured under Rule S5; no separate feedback file.
+
 ### Rule 4 — Pivot Buy (LONG L-A) / Pivot Short-Sell (SHORT S-A)
 
-Strict breakout entry. LONG: buy-stop placed 0.5×ATR14 above pivot.
-SHORT: sell-stop 0.5×ATR14 below neckline. Tick that crosses the
+Strict breakout entry. LONG: buy-stop placed 0.35×ATR14 above pivot.
+SHORT: sell-stop 0.35×ATR14 below neckline. Tick that crosses the
 trigger **strictly** (not just inside zone) is the entry signal.
 
-The **0.5×ATR zone width** (Raschke / Masterclass canonical "natural
-volatility unit") replaces the legacy fixed 3% buffer (changed
-2026-04-28). Reasoning: a fixed 3% buffer ignores each stock's natural
-volatility — KO ($80) and NVDA ($209) both got 3%, but a 3% NVDA move
-is over a full ATR of slack and effectively unreachable inside the
-intraday-managed window. ATR-scaling adapts proportionally to each
-stock and matches what Raschke / Minervini call "above the pivot, but
-not chasing".
+The **0.35×ATR zone width** (LBR-aligned for intraday-managed profile)
+replaces the legacy fixed 3% buffer (changed 2026-04-28 to 0.5×ATR;
+tightened to 0.35 on 2026-04-29). Two reasons for the second tightening:
+
+1. **0.5×ATR is the canonical SWING buffer**, not the day-trade buffer.
+   Multi-day swing trades have 2-3 days for confirmation and tolerate a
+   half-ATR pre-confirmation buffer. Same-day intraday-managed entries
+   (09:45-15:55 ET window) cannot — the buffer eats ~1/3 of the move
+   before the strict-break trigger fires. LMT 2026-04-29 case study:
+   pivot 512.29, real breakdown 10:00 ET, strict break of 503.90
+   (0.5×ATR low) didn't fire until 10:39 ET. With 0.35×ATR (trigger_low
+   506.42) the strict break would have fired at 10:25 ET — meaningfully
+   earlier without weakening Rule 22.
+2. **Pairs with Rule S5** (day-trade entries cutoff at 11:15 ET). The
+   tighter zone fires earlier; the cutoff guards against chasing if the
+   trigger never confirms. Together they preserve Rule 22's anti-
+   whipsaw discipline while restoring the R:R-at-fill the swing-buffer
+   was destroying.
 
 The arithmetic is computed deterministically server-side in
 `swing-committee/lib/triggerDerivation.js` (see `docs/lean_scan_spec.md`
@@ -231,10 +275,10 @@ The arithmetic is computed deterministically server-side in
 `money-program-trading/src/backtest/replay_scanner.py`.
 
 - **Applies to:** L-A (LONG) / S-A (SHORT) primarily; informs **Rule 22**
-- **Zone formula (LONG):** `trigger_low = lastClose; trigger_high = lastClose + ATR14 × 0.5`
-- **Zone formula (SHORT):** `trigger_high = lastClose; trigger_low = lastClose − ATR14 × 0.5`
+- **Zone formula (LONG):** `trigger_low = lastClose; trigger_high = lastClose + ATR14 × 0.35`
+- **Zone formula (SHORT):** `trigger_high = lastClose; trigger_low = lastClose − ATR14 × 0.35`
 - **Code status:** ✓ ENFORCED via Rule 22 (commit `008d200` 2026-04-24).
-  Zone formula updated 2026-04-28 — pending commit on swing-committee main.
+  Zone formula updated 2026-04-29 — pending commit on swing-committee main.
 - **Memory:** `feedback_trigger_semantics`.
 
 ### Rule 4-Chase — Open > pivot + 3% → SKIP
@@ -451,8 +495,9 @@ Failed gap → 3-day window to reclaim, then quarantine for 10 days.
 | S2 Price available | BOTH | classify_tick | ✓ |
 | S3 Entries open | BOTH | classify_tick | ✓ |
 | S4 Entries cutoff | BOTH | classify_tick | ✓ |
+| S5 Day-trade cutoff | BOTH | classify_tick | ✓ (default ON 11:15 ET / 10:30 UK, opt-out via `day_trade_cutoff_local=None`) |
 | 4 Pivot Buy | L-A/S-A | classify_tick (Rule 22) | ✓ |
-| 4-Chase | BOTH | classify_tick | ✗ |
+| 4-Chase | BOTH | classify_tick | ✓ |
 | 5 Volume Confirm | BOTH | classify_tick | **DROPPED** (intraday-only profile) |
 | 6 EMA Pullback | L-B/S-B | classify_tick | **DROPPED** (L-A only universe) |
 | 9A BGU 15-min OR | LONG | classify_tick | ✓ |

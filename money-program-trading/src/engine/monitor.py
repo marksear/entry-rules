@@ -387,6 +387,30 @@ def classify_tick(
         and now is not None
         and session_clock.is_before_entries_open(now)
     )
+    # Rule S5 — LBR day-trade entry cutoff (added 2026-04-29).
+    # Directional intraday entries should initiate in the first ~1.5 h
+    # post-open. After 11:15 ET (US) / 10:30 UK (UK), the morning's
+    # directional regime has typically played out — afternoon entries
+    # chase mature moves with deteriorated R:R. Suppresses FIRE with
+    # ``R_DAY_TRADE_CUTOFF`` after the threshold even if the strict-
+    # break trigger has fired.
+    #
+    # ``getattr(...)`` fallback is for back-compat with legacy test
+    # stubs (e.g. _StubClockPastCutoff in test_monitor_bgu.py) that
+    # implement the older ``is_past_entries_cutoff`` /
+    # ``is_before_entries_open`` surface but not the new method.
+    # Production SessionClock always has it.
+    _is_past_day_trade_cutoff = (
+        getattr(session_clock, "is_past_day_trade_cutoff", None)
+        if session_clock is not None
+        else None
+    )
+    day_trade_cutoff_hit = (
+        session_clock is not None
+        and now is not None
+        and _is_past_day_trade_cutoff is not None
+        and _is_past_day_trade_cutoff(now)
+    )
 
     if plan.direction == Direction.LONG:
         distance = last - plan.trigger_low  # ≥0 means price has entered zone
@@ -441,6 +465,12 @@ def classify_tick(
                     rejection_code="R_SESSION_CUTOFF",
                     distance_pts=distance,
                 )
+            if day_trade_cutoff_hit:
+                return TickOutcome(
+                    decision=Decision.REJECT,
+                    rejection_code="R_DAY_TRADE_CUTOFF",
+                    distance_pts=distance,
+                )
             return TickOutcome(decision=Decision.FIRE, distance_pts=distance)
         # arm band: how far (in pts) below trigger_low
         band_pts = plan.trigger_low * arm_band_pct
@@ -479,6 +509,12 @@ def classify_tick(
                 return TickOutcome(
                     decision=Decision.REJECT,
                     rejection_code="R_SESSION_CUTOFF",
+                    distance_pts=distance,
+                )
+            if day_trade_cutoff_hit:
+                return TickOutcome(
+                    decision=Decision.REJECT,
+                    rejection_code="R_DAY_TRADE_CUTOFF",
                     distance_pts=distance,
                 )
             return TickOutcome(decision=Decision.FIRE, distance_pts=distance)

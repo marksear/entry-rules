@@ -225,7 +225,11 @@ def test_classify_tick_fires_normally_before_entries_cutoff():
         gap_up_detected=False,
     )
     clock = SessionClock.for_us_session(date(2026, 4, 17))
-    now = datetime(2026, 4, 17, 17, 0, tzinfo=timezone.utc)  # well before cutoff
+    # 14:30 UTC = 10:30 ET — between entries-open (09:45 ET) and the
+    # new day-trade cutoff (11:15 ET, Rule S5 added 2026-04-29). Was
+    # 17:00 UTC / 13:00 ET pre-S5; that's now past the day-trade
+    # cutoff so the test moved earlier into the entries window.
+    now = datetime(2026, 4, 17, 14, 30, tzinfo=timezone.utc)
 
     # Strictly above trigger_high=101.0 so the R22 breakout gate passes
     # and the test exercises the session-cutoff path in isolation.
@@ -528,3 +532,144 @@ def test_evaluate_exit_initial_stop_beats_hard_close_when_both_would_fire():
 
     assert outcome.action == ExitAction.EXIT
     assert outcome.reason == ExitReason.HARD_CLOSE
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Rule S5 — R_DAY_TRADE_CUTOFF (LBR 11:15 ET / 10:30 UK), added 2026-04-29
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_classify_tick_rejects_with_r_day_trade_cutoff_after_1115_et():
+    """LMT-style late breakdown that fires Rule 22 strict-break AFTER
+    11:15 ET. The new Rule S5 gate must reject with R_DAY_TRADE_CUTOFF —
+    LBR's intraday discipline says morning entries only, no chasing
+    afternoon-mature moves."""
+    plan = _make_plan()  # LONG, trigger_high=101.0
+    state = CandidateRuntimeState(
+        session_open_price=95.0,
+        session_open_ts_utc=datetime(2026, 4, 17, 13, 30, tzinfo=timezone.utc),
+        gap_up_detected=False,
+    )
+    clock = SessionClock.for_us_session(date(2026, 4, 17))
+    # 15:20 UTC = 11:20 ET — past 11:15 ET day-trade cutoff but well
+    # before the 18:30 entries-cutoff. R_DAY_TRADE_CUTOFF wins.
+    now = datetime(2026, 4, 17, 15, 20, tzinfo=timezone.utc)
+
+    snap = {"last_traded": 101.25, "market_status": "TRADEABLE"}
+    outcome = classify_tick(plan, snap, state, session_clock=clock, now=now)
+
+    assert outcome.decision == Decision.REJECT
+    assert outcome.rejection_code == "R_DAY_TRADE_CUTOFF"
+
+
+def test_classify_tick_rejects_short_with_r_day_trade_cutoff():
+    """SHORT mirror: strict break below trigger_low after 11:15 ET → reject."""
+    plan = _make_plan(
+        direction=Direction.SHORT, trigger_low=99.0, trigger_high=100.0, stop_price=105.0
+    )
+    state = CandidateRuntimeState()
+    clock = SessionClock.for_us_session(date(2026, 4, 17))
+    now = datetime(2026, 4, 17, 15, 20, tzinfo=timezone.utc)  # 11:20 ET
+
+    snap = {"last_traded": 98.5, "market_status": "TRADEABLE"}  # below trigger_low
+    outcome = classify_tick(plan, snap, state, session_clock=clock, now=now)
+
+    assert outcome.decision == Decision.REJECT
+    assert outcome.rejection_code == "R_DAY_TRADE_CUTOFF"
+
+
+def test_classify_tick_fires_at_day_trade_cutoff_boundary():
+    """Boundary: a tick exactly at 11:15 ET (15:15 UTC during EDT) is
+    PAST the cutoff (>=). One minute earlier (11:14) still fires."""
+    plan = _make_plan()
+    state = CandidateRuntimeState(
+        session_open_price=95.0,
+        session_open_ts_utc=datetime(2026, 4, 17, 13, 30, tzinfo=timezone.utc),
+        gap_up_detected=False,
+    )
+    clock = SessionClock.for_us_session(date(2026, 4, 17))
+    snap = {"last_traded": 101.25, "market_status": "TRADEABLE"}
+
+    # 11:14 ET — strictly before cutoff → FIRE
+    now_before = datetime(2026, 4, 17, 15, 14, tzinfo=timezone.utc)
+    outcome_before = classify_tick(
+        plan, snap, state, session_clock=clock, now=now_before
+    )
+    assert outcome_before.decision == Decision.FIRE
+
+    # 11:15 ET — at cutoff (>=) → REJECT
+    state2 = CandidateRuntimeState(
+        session_open_price=95.0,
+        session_open_ts_utc=datetime(2026, 4, 17, 13, 30, tzinfo=timezone.utc),
+        gap_up_detected=False,
+    )
+    now_at = datetime(2026, 4, 17, 15, 15, tzinfo=timezone.utc)
+    outcome_at = classify_tick(plan, snap, state2, session_clock=clock, now=now_at)
+    assert outcome_at.decision == Decision.REJECT
+    assert outcome_at.rejection_code == "R_DAY_TRADE_CUTOFF"
+
+
+def test_classify_tick_arm_and_hold_unaffected_by_day_trade_cutoff():
+    """Rule S5 suppresses FIRE only — ARM and HOLD continue past 11:15
+    so the journal still records candidate state for post-session review."""
+    plan = _make_plan(trigger_low=100.0, trigger_high=101.0)
+    state = CandidateRuntimeState()
+    clock = SessionClock.for_us_session(date(2026, 4, 17))
+    now = datetime(2026, 4, 17, 16, 0, tzinfo=timezone.utc)  # 12:00 ET, past cutoff
+
+    # Inside arm band, below trigger_low → ARM should still emit.
+    arm_snap = {"last_traded": 99.6, "market_status": "TRADEABLE"}
+    outcome_arm = classify_tick(
+        plan, arm_snap, state, arm_band_pct=0.005, session_clock=clock, now=now,
+    )
+    assert outcome_arm.decision == Decision.ARM
+
+    # Far below trigger → HOLD.
+    hold_snap = {"last_traded": 95.0, "market_status": "TRADEABLE"}
+    outcome_hold = classify_tick(
+        plan, hold_snap, state, session_clock=clock, now=now,
+    )
+    assert outcome_hold.decision == Decision.HOLD
+
+
+def test_day_trade_cutoff_disabled_when_clock_built_with_none():
+    """Back-compat: callers can opt out by passing day_trade_cutoff_local=None
+    when building the clock. Strict break past 11:15 ET fires normally."""
+    plan = _make_plan()
+    state = CandidateRuntimeState(
+        session_open_price=95.0,
+        session_open_ts_utc=datetime(2026, 4, 17, 13, 30, tzinfo=timezone.utc),
+        gap_up_detected=False,
+    )
+    clock = SessionClock.for_us_session(date(2026, 4, 17), day_trade_cutoff_local=None)
+    # 11:30 ET — would normally trip R_DAY_TRADE_CUTOFF but the gate is off.
+    now = datetime(2026, 4, 17, 15, 30, tzinfo=timezone.utc)
+
+    snap = {"last_traded": 101.25, "market_status": "TRADEABLE"}
+    outcome = classify_tick(plan, snap, state, session_clock=clock, now=now)
+
+    assert outcome.decision == Decision.FIRE
+
+
+def test_session_cutoff_wins_over_day_trade_cutoff_when_both_hit():
+    """Both cutoffs hit simultaneously (e.g. test fixture at 13:00 ET
+    of a session that closed at 11:00 ET — synthetic edge case). The
+    earlier-firing R_SESSION_CUTOFF should win because it's the harder
+    constraint (also the existing rejection code path order)."""
+    plan = _make_plan()
+    state = CandidateRuntimeState(
+        session_open_price=95.0,
+        session_open_ts_utc=datetime(2026, 4, 17, 13, 30, tzinfo=timezone.utc),
+        gap_up_detected=False,
+    )
+    clock = SessionClock.for_us_session(date(2026, 4, 17))
+    # 18:31 UTC = 14:31 ET — past 18:30 entries-cutoff AND past 11:15
+    # day-trade cutoff. R_SESSION_CUTOFF should win (checked first in
+    # classify_tick's order).
+    now = datetime(2026, 4, 17, 18, 31, tzinfo=timezone.utc)
+
+    snap = {"last_traded": 101.25, "market_status": "TRADEABLE"}
+    outcome = classify_tick(plan, snap, state, session_clock=clock, now=now)
+
+    assert outcome.decision == Decision.REJECT
+    assert outcome.rejection_code == "R_SESSION_CUTOFF"
