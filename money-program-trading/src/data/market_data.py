@@ -99,18 +99,48 @@ class MarketData:
         Resolve a ticker symbol to an IG epic identifier.
         Caches results — market IDs rarely change.
 
+        UK retry policy (Task #67, 2026-04-29):
+        IG's internal LSE convention uses an ``LN`` suffix on the share
+        symbol — M&G's epic is ``KA.D.MNGLN.DAILY.IP``, not
+        ``KA.D.MNG.DAILY.IP``. When market=UK and the bare-ticker
+        search returns empty, retry with ``<TICKER>LN`` before giving
+        up. Tickers that already end in ``LN`` skip the retry. The
+        retry result is cached under the ORIGINAL cache key so callers
+        don't need to know about the LN convention.
+
         Args:
-            ticker: Stock symbol (e.g., "AAPL", "VOD")
+            ticker: Stock symbol (e.g., "AAPL", "VOD", "MNG")
             market: "US" or "UK"
 
         Returns:
-            IG epic string (e.g., "KA.D.AAPL.CASH.IP")
+            IG epic string (e.g., "KA.D.AAPL.CASH.IP", "KA.D.MNGLN.DAILY.IP")
         """
         cache_key = f"{ticker}:{market}"
         if cache_key in self._epic_cache:
             return self._epic_cache[cache_key]
 
         epic = self._search_market(ticker, market)
+
+        # UK LN-suffix retry. Reckitt Benckiser is the only known UK
+        # exception that keeps its bare ticker on IG (KA.D.RB.DAILY.IP),
+        # but the bare-ticker search finds RB as part of the same row
+        # so the retry is wasted-but-harmless there. MNG, RKT
+        # (when scanner ships it as MNG/RKT), VOD etc. need the retry.
+        if not epic and market == "UK":
+            ticker_upper = ticker.upper()
+            if not ticker_upper.endswith("LN"):
+                ln_ticker = f"{ticker}LN"
+                logger.info(
+                    "resolve_epic: %s (UK) — bare-ticker search empty, "
+                    "retrying with LN suffix: %s", ticker, ln_ticker,
+                )
+                epic = self._search_market(ln_ticker, market)
+                if epic:
+                    logger.info(
+                        "resolve_epic: %s → %s via LN-suffix retry",
+                        ticker, epic,
+                    )
+
         if epic:
             self._epic_cache[cache_key] = epic
             self._save_epic_cache()
@@ -136,8 +166,17 @@ class MarketData:
            ``ON.D.AMDsa15500P6.CASH.IP`` will never match "AMD" because
            the substring "AMD" sits inside ``AMDsa15500P6`` — only whole
            segments count.
-        3. For UK, additionally require LSE/.L markers (preserves the old
-           UK filter).
+        3. For UK, additionally require a UK-share marker. Three are
+           accepted (Task #68, 2026-04-29):
+           - ``LSE`` substring in instrumentName (legacy — but IG often
+             omits it for many UK shares; "M&G PLC" has no LSE marker).
+           - ``.L`` literal in the ticker (Yahoo / Bloomberg convention).
+           - Ticker ends in ``LN`` (IG's internal LSE convention —
+             ``MNGLN`` for M&G, ``RKTLN`` for Reckitt back when it
+             carried that name; surfaced via the LN-suffix retry in
+             ``resolve_epic``).
+           Without one of those three the row is rejected — guards
+           against pulling a US listing into a UK candidate.
         4. **Preference order among valid matches:** CASH > DFB > DAILY.
            CASH is the cleanest (true undated cash market); DFB has
            overnight funding; DAILY is the 24-hour flavour and is fine
@@ -210,8 +249,14 @@ class MarketData:
                     continue  # not a spread-bet flavour or dated-expiry
                 if not _ticker_match(epic, name_upper):
                     continue
-                if market == "UK" and not ("LSE" in name_upper or ".L" in ticker):
-                    continue
+                if market == "UK":
+                    is_uk_share = (
+                        "LSE" in name_upper
+                        or ".L" in ticker
+                        or ticker.upper().endswith("LN")
+                    )
+                    if not is_uk_share:
+                        continue
 
                 if priority < best_priority:
                     best_epic = epic

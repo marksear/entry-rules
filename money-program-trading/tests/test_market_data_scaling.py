@@ -45,14 +45,26 @@ class FakeIGService:
         return self._search_response
 
 
-def _make_market_data(ig_service) -> MarketData:
+def _make_market_data(ig_service, tmp_dir=None) -> MarketData:
     """Build a MarketData without touching the real IG session or disk
-    cache. We skip ``__init__`` so we don't hit the parquet directory."""
+    cache. We skip ``__init__`` so we don't hit the parquet directory.
+
+    ``tmp_dir`` is set to an in-memory-ish location so resolve_epic can
+    persist its cache without hitting the production data/cache/ path.
+    """
+    import tempfile
+    from pathlib import Path
     md = MarketData.__new__(MarketData)
     md._session = SimpleNamespace(service=ig_service)
     md._epic_cache = {}
     md._bar_cache = {}
     md._scale_cache = {}
+    # _cache_dir is only used by _save_epic_cache when resolve_epic
+    # successfully resolves a new ticker. Tests that only call
+    # _search_market never hit it, but tests that exercise the public
+    # resolve_epic path do.
+    md._cache_dir = Path(tmp_dir or tempfile.mkdtemp(prefix="md_test_"))
+    md._cache_dir.mkdir(parents=True, exist_ok=True)
     return md
 
 
@@ -624,3 +636,130 @@ def test_resolve_scaling_factor_back_compat_no_snapshot_arg():
         ask_raw=39120.0,
     )
     assert sf == 100.0
+
+
+# ---------------------------------------------------------------------------
+# 2026-04-29 UK epic resolution — Tasks #67 (LN-suffix retry) + #68 (UK gate)
+# ---------------------------------------------------------------------------
+#
+# Captured from today's debug_uk_search.py diagnostic against IG:
+#   MNG search → returns KA.D.MNGLN.DAILY.IP, "M&G PLC"
+#                (no "LSE" in instrumentName)
+#   RKT search → returns SG.D.RKTUS.DAILY.IP, "Rocket Companies (24 Hours)"
+#                (US ticker collision; correctly rejected)
+#   Reckitt    → returns KA.D.RB.DAILY.IP, "Reckitt Benckiser Group PLC"
+#                (no "LSE" in instrumentName)
+#
+# Old behaviour:
+#   resolve_epic("MNG", "UK") → bare-ticker search finds the MNGLN epic
+#   row but rejects it via _ticker_match (MNG ≠ MNGLN as whole token).
+#   No fallback. NO_EPIC.
+#
+# New behaviour (this fix):
+#   resolve_epic("MNG", "UK") → bare-ticker search empty → retry with
+#   "MNGLN" → finds KA.D.MNGLN.DAILY.IP. UK gate accepts because the
+#   retry ticker ends in "LN".
+
+
+def test_resolve_epic_uk_ln_suffix_retry_finds_mng():
+    """MNG (bare) → empty → retry with MNGLN → finds KA.D.MNGLN.DAILY.IP."""
+    # IG returns the same row regardless of which ticker we search for.
+    # The first call (with "MNG") fails because "MNG" is not a whole
+    # token in "KA.D.MNGLN.DAILY.IP". The retry with "MNGLN" succeeds.
+    mng_row = {
+        "epic": "KA.D.MNGLN.DAILY.IP",
+        "instrumentName": "M&G PLC",
+        "instrumentType": "SHARES",
+    }
+    ig = FakeIGService(search_response=pd.DataFrame([mng_row]))
+    md = _make_market_data(ig)
+
+    epic = md.resolve_epic("MNG", "UK")
+    assert epic == "KA.D.MNGLN.DAILY.IP", (
+        f"expected MNGLN epic via LN-suffix retry, got {epic!r}"
+    )
+
+
+def test_resolve_epic_caches_under_original_ticker_after_ln_retry():
+    """After the LN-suffix retry succeeds, the cache key uses the
+    ORIGINAL ticker (MNG:UK), not MNGLN:UK. Callers don't need to know
+    about the LN convention."""
+    mng_row = {
+        "epic": "KA.D.MNGLN.DAILY.IP",
+        "instrumentName": "M&G PLC",
+        "instrumentType": "SHARES",
+    }
+    ig = FakeIGService(search_response=pd.DataFrame([mng_row]))
+    md = _make_market_data(ig)
+
+    md.resolve_epic("MNG", "UK")
+    assert md._epic_cache.get("MNG:UK") == "KA.D.MNGLN.DAILY.IP"
+    assert "MNGLN:UK" not in md._epic_cache
+
+
+def test_resolve_epic_skips_ln_retry_when_ticker_already_ends_in_ln():
+    """Direct MNGLN lookup: bare-ticker search finds it, no retry needed."""
+    mng_row = {
+        "epic": "KA.D.MNGLN.DAILY.IP",
+        "instrumentName": "M&G PLC",
+        "instrumentType": "SHARES",
+    }
+    ig = FakeIGService(search_response=pd.DataFrame([mng_row]))
+    md = _make_market_data(ig)
+
+    epic = md.resolve_epic("MNGLN", "UK")
+    assert epic == "KA.D.MNGLN.DAILY.IP"
+
+
+def test_search_market_accepts_uk_share_with_ln_ticker_suffix():
+    """The relaxed UK gate (Task #68) accepts rows where the ticker
+    ends in "LN" — IG's internal LSE convention. No "LSE" substring
+    needed in the instrumentName."""
+    mng_row = {
+        "epic": "KA.D.MNGLN.DAILY.IP",
+        "instrumentName": "M&G PLC",
+        "instrumentType": "SHARES",
+    }
+    md = _make_market_data(
+        FakeIGService(search_response=pd.DataFrame([mng_row]))
+    )
+    # Simulate the LN-suffix retry path by calling _search_market directly
+    # with the LN ticker. The gate must accept.
+    epic = md._search_market("MNGLN", "UK")
+    assert epic == "KA.D.MNGLN.DAILY.IP"
+
+
+def test_search_market_uk_still_rejects_us_collision_ticker():
+    """RKT-shape: search returns SG.D.RKTUS.DAILY.IP "Rocket Companies".
+    With market=UK, the gate must reject this US ticker. The whole-token
+    match alone catches it (RKT not in epic segments), but defence-in-
+    depth: even if it matched, the UK gate would reject (no LSE / .L /
+    LN-suffix marker on this row's instrumentName or ticker)."""
+    rocket_row = {
+        "epic": "SG.D.RKTUS.DAILY.IP",
+        "instrumentName": "Rocket Companies Inc (24 Hours)",
+        "instrumentType": "SHARES",
+    }
+    md = _make_market_data(
+        FakeIGService(search_response=pd.DataFrame([rocket_row]))
+    )
+    # Whole-token match fails (RKT not a segment in RKTUS). Plus the
+    # UK gate would reject if it ever got there.
+    assert md._search_market("RKT", "UK") == ""
+
+
+def test_search_market_uk_accepts_legacy_lse_in_name():
+    """Back-compat: rows whose instrumentName explicitly contains "LSE"
+    still pass the gate (some older epic families do)."""
+    legacy_row = {
+        "epic": "KA.D.SBRY.DAILY.IP",
+        "instrumentName": "Sainsbury (J) PLC (LSE)",
+        "instrumentType": "SHARES",
+    }
+    md = _make_market_data(
+        FakeIGService(search_response=pd.DataFrame([legacy_row]))
+    )
+    epic = md._search_market("SBRY", "UK")
+    assert epic == "KA.D.SBRY.DAILY.IP"
+
+
