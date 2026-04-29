@@ -108,25 +108,34 @@ def resolve_scaling_factor(
     plus the US-equity-DAILY.IP fallback heuristic.
 
     Precedence (highest first):
-    1. ``snapshot['scalingFactor']`` if present and > 0 — IG's
-       authoritative per-snapshot answer. **Added 2026-04-29** after the
-       RKT bug exposed that IG populates this field on the snapshot
-       block, not the instrument block, for at least UK shares. Old
-       callers that don't pass ``snapshot`` get the historical behaviour.
-    2. ``instrument['scalingFactor']`` if present and > 0 — use verbatim.
-       Historical path; appears to be empty for many newer epics.
-    3. ``100.0`` if (a) the epic looks like a single-name equity spread-bet
+    1. ``instrument['scalingFactor']`` if present and > 0 — IG's
+       authoritative per-instrument answer for US equity DAILY.IP
+       epics (typically ``100``, meaning prices come back in minor
+       units / cents).
+    2. ``100.0`` if (a) the epic looks like a single-name equity spread-bet
        AND (b) raw bid/ask look like minor units (one > 1500) AND
        (c) the instrument is NOT a GBP/GBX share. The GBP guard prevents
        the false-positive on high-priced UK shares (Reckitt, AstraZeneca,
        Unilever, etc. all trade above 1500p in native pence).
-    4. ``1.0`` default — logs an info line with the instrument type for
+    3. ``1.0`` default — logs an info line with the instrument type for
        diagnosis.
+
+    The ``snapshot`` parameter is accepted for forward-compatibility
+    but **deliberately not consulted** — IG's
+    ``snapshot.scalingFactor`` is misleading for US equities (returns
+    ``1`` even when prices are quoted in cents and need a 100x divide).
+    The 2026-04-29 RKT fix originally tried to read snapshot first;
+    that caused a regression on AMGN/LMT (US cent-quoted shares with
+    snapshot.scalingFactor=1 short-circuiting the correct heuristic).
+    The GBP-share guard added in step 2 is sufficient to handle the
+    UK pence case (RB / MNGLN / SBRY) without consulting snapshot.
 
     This function is intentionally pure: no caching, no IG calls. The
     caller owns the cache. See ``RestPriceFeed._scale_cache`` /
     ``LightstreamerPriceFeed._scale_cache``.
     """
+    del snapshot  # accepted for back-compat; see docstring for rationale
+
     def _f(v):
         if v is None or v == "":
             return None
@@ -135,25 +144,9 @@ def resolve_scaling_factor(
         except (TypeError, ValueError):
             return None
 
-    # 1. Snapshot-level scalingFactor — IG's authoritative answer when
-    #    present. Surfaced 2026-04-29: Reckitt's KA.D.RB.DAILY.IP returns
-    #    snapshot.scalingFactor=1, decimalPlacesFactor=1, but the
-    #    instrument block omits scalingFactor entirely. Without this
-    #    branch the fallback heuristic kicked in and divided 4682.3p
-    #    by 100.
-    snap_sf = None
-    if isinstance(snapshot, dict):
-        snap_sf = _f(snapshot.get("scalingFactor"))
-    if snap_sf is not None and snap_sf > 0:
-        logger.debug(
-            "resolve_scaling_factor: %s — scalingFactor=%s from snapshot",
-            epic, snap_sf,
-        )
-        return snap_sf
-
-    # 2. Instrument-level scalingFactor — historical path. Still used
-    #    by older fixtures and any future epic family that populates
-    #    here instead of the snapshot.
+    # 1. Instrument-level scalingFactor — authoritative when present.
+    #    US equity DAILY.IP typically reports 100 here. UK pence shares
+    #    typically report None and rely on step 2's GBP guard.
     raw_sf = None
     if isinstance(instrument, dict):
         raw_sf = instrument.get("scalingFactor")

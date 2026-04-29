@@ -467,17 +467,23 @@ def test_search_market_skips_dated_rows_and_picks_daily():
 #       the heuristic wouldn't fire on UK shares.
 
 
-def test_snapshot_scaling_factor_takes_precedence_over_instrument():
-    """RKT-shape: snapshot says scalingFactor=1, instrument is empty. The
-    correct answer is 1.0 — IG's snapshot is authoritative. Without this
-    branch the fallback heuristic would run on bid=4682.3 and incorrectly
-    return 100."""
+def test_uk_share_above_1500_correctly_unscaled_via_gbp_guard():
+    """RB-shape (Reckitt Benckiser, KA.D.RB.DAILY.IP): bid=4682.3 in
+    pence, GBP currency, instrument lacks scalingFactor. Must return
+    1.0 (no divide) — the GBP guard suppresses the fallback heuristic
+    that would otherwise return 100 for any bid > 1500.
+
+    NOTE: snapshot.scalingFactor is also 1 in real IG responses, but
+    we deliberately don't consult it (the 2026-04-29 regression on
+    AMGN/LMT showed snapshot.scalingFactor=1 is misleading for US
+    cent-quoted shares). The GBP guard is the load-bearing fix."""
     ig = FakeIGService(
         markets_response={
             "instrument": {
                 "type": "SHARES",
                 "name": "Reckitt Benckiser Group PLC",
                 "currencies": [{"code": "GBP", "symbol": "£", "isDefault": True}],
+                # No scalingFactor on instrument — typical for UK shares.
             },
             "snapshot": {
                 "bid": 4682.3,
@@ -485,7 +491,7 @@ def test_snapshot_scaling_factor_takes_precedence_over_instrument():
                 "lastTraded": 4688.5,
                 "high": 4760.7,
                 "low": 4682.3,
-                "scalingFactor": 1,
+                "scalingFactor": 1,  # IG sets this but we ignore it
                 "decimalPlacesFactor": 1,
                 "marketStatus": "TRADEABLE",
             },
@@ -496,12 +502,54 @@ def test_snapshot_scaling_factor_takes_precedence_over_instrument():
     snap = md.get_market_snapshot("KA.D.RB.DAILY.IP")
 
     assert snap["scaling_factor"] == 1.0, (
-        "RB has snapshot.scalingFactor=1; resolver must honour it and NOT "
-        "divide by 100 via the fallback heuristic."
+        "RB is GBP — heuristic must be suppressed by the GBP guard "
+        "and default to 1.0 (no divide on 4682.3 pence)."
     )
     assert snap["bid"] == pytest.approx(4682.3)
     assert snap["ask"] == pytest.approx(4694.7)
     assert snap["last_traded"] == pytest.approx(4688.5)
+
+
+def test_us_equity_with_explicit_instrument_scaling_factor_100():
+    """LMT/AMGN-shape regression test (2026-04-29): US equity DAILY.IP
+    epic with instrument.scalingFactor=100, snapshot.scalingFactor=1
+    (misleading), bid in cents. Must return 100 — the instrument-
+    level scalingFactor is authoritative. The bug we're guarding
+    against: yesterday's "prefer snapshot.scalingFactor" change
+    short-circuited this and returned 1, leaving prices in cents
+    (51361 displayed instead of 513.61)."""
+    ig = FakeIGService(
+        markets_response={
+            "instrument": {
+                "type": "SHARES",
+                "name": "Lockheed Martin",
+                "scalingFactor": 100,  # IG's canonical US-equity value
+                "currencies": [
+                    {"code": "USD", "symbol": "$", "isDefault": False},
+                    {"code": "GBP", "symbol": "£", "isDefault": True},
+                ],
+            },
+            "snapshot": {
+                "bid": 51361.0,
+                "offer": 51400.0,
+                "lastTraded": 51380.0,
+                "scalingFactor": 1,  # The misleading-for-US value
+                "decimalPlacesFactor": 1,
+                "marketStatus": "TRADEABLE",
+            },
+        }
+    )
+    md = _make_market_data(ig)
+
+    snap = md.get_market_snapshot("UA.D.LMT.DAILY.IP")
+
+    assert snap["scaling_factor"] == 100.0, (
+        "instrument.scalingFactor=100 must win — snapshot.scalingFactor=1 "
+        "is misleading for US cent-quoted shares (regression source)."
+    )
+    assert snap["bid"] == pytest.approx(513.61)
+    assert snap["ask"] == pytest.approx(514.00)
+    assert snap["last_traded"] == pytest.approx(513.80)
 
 
 def test_uk_share_above_1500_not_scaled_when_currency_gbp():
@@ -569,14 +617,21 @@ def test_us_equity_above_1500_still_scaled_when_currency_usd():
     assert snap["last_traded"] == pytest.approx(391.005)
 
 
-def test_resolve_scaling_factor_unit_snapshot_path():
-    """Direct unit test of resolve_scaling_factor: snapshot.scalingFactor
-    short-circuits everything else."""
+def test_resolve_scaling_factor_ignores_snapshot_for_back_compat():
+    """Direct unit test (2026-04-29 LMT/AMGN regression fix):
+    snapshot.scalingFactor is deliberately ignored. RB-shape with no
+    instrument.scalingFactor → falls through to the GBP-guarded
+    heuristic → returns 1.0 because GBP suppresses the >1500
+    fallback. The snapshot kwarg is accepted but unused."""
     from src.data.scaling import resolve_scaling_factor
 
     sf = resolve_scaling_factor(
         epic="KA.D.RB.DAILY.IP",
-        instrument={"type": "SHARES", "name": "Reckitt"},
+        instrument={
+            "type": "SHARES",
+            "name": "Reckitt",
+            "currencies": [{"code": "GBP", "isDefault": True}],
+        },
         bid_raw=4682.3,
         ask_raw=4694.7,
         snapshot={"scalingFactor": 1},
